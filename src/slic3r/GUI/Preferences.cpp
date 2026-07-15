@@ -20,6 +20,7 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "NetworkPluginDialog.hpp"
 #include "DownloadProgressDialog.hpp"
+#include "slic3r/GUI/RemoteAPI/RemoteAPIConfig.hpp"
 
 #ifdef __WINDOWS__
 #ifdef _MSW_DARK_MODE
@@ -2143,6 +2144,11 @@ void PreferencesDialog::create_items()
     g_sizer->AddSpacer(FromDIP(10));
     sizer_page->Add(g_sizer, 0, wxEXPAND);
 
+    //////////////////////////
+    //// REMOTE API TAB
+    /////////////////////////////////////
+    create_remote_api_page(sizer_page, v_gap);
+
     /////////////////////////////////////
     //////////////////////////
 
@@ -2305,6 +2311,77 @@ wxBoxSizer* PreferencesDialog::create_debug_page()
     bSizer->Add(debug_button, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, FromDIP(15));
 
     return bSizer;
+}
+
+void PreferencesDialog::create_remote_api_page(wxBoxSizer* sizer_page, int v_gap)
+{
+    m_pref_tabs->AppendItem(_L("Remote API"));
+    f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
+    auto g_sizer = f_sizers.back();
+    g_sizer->AddGrowableCol(0, 1);
+
+    g_sizer->Add(create_item_title(_L("Remote Control API")), 1, wxEXPAND);
+
+    // Enable toggle. Actually starting/stopping the server happens when the
+    // dialog closes (GUI_App::open_preferences calls stop_remote_api()/start_remote_api()
+    // right after ShowModal() returns), so all these checkboxes/inputs just persist
+    // AppConfig here, same as every other preference on this page.
+    auto item_enable = create_item_checkbox(
+        _L("Enable Remote API"),
+        _L("Allow external tools (e.g. AI agents via MCP) to read and change "
+           "slicer settings and trigger slicing on this machine."),
+        "remote_api_enabled");
+    g_sizer->Add(item_enable);
+
+    auto item_lan = create_item_checkbox(
+        _L("Allow LAN access"),
+        _L("Off: only this computer (127.0.0.1). On: other devices on your "
+           "local network can control this slicer with the token."),
+        "remote_api_bind_lan");
+    g_sizer->Add(item_lan);
+
+    // create_item_input's wxEVT_TEXT_ENTER/wxEVT_KILL_FOCUS handlers call
+    // onchange(value) unconditionally (no null check), so the default-constructed
+    // std::function<> would throw std::bad_function_call the first time this field
+    // loses focus. Pass an explicit no-op instead of omitting the argument.
+    auto item_port = create_item_input(_L("Port"), "",
+                                       _L("TCP port for the Remote API (default 13130)"),
+                                       "remote_api_port", [](wxString) {});
+    g_sizer->Add(item_port);
+
+    // Token row: read-only display + regenerate. Bespoke (not one of the stock
+    // create_item_* factories) because it needs three widgets sharing one row and
+    // a button action that also restarts the running server.
+    wxBoxSizer *token_sizer = new wxBoxSizer(wxHORIZONTAL);
+    token_sizer->AddSpacer(FromDIP(DESIGN_LEFT_MARGIN));
+
+    auto token_label = new wxStaticText(m_parent, wxID_ANY, _L("API token"), wxDefaultPosition, DESIGN_TITLE_SIZE, wxST_NO_AUTORESIZE);
+    token_label->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    token_label->SetFont(::Label::Body_14);
+    token_label->Wrap(DESIGN_TITLE_SIZE.x);
+
+    auto token_value = new wxTextCtrl(m_parent, wxID_ANY, wxString(app_config->get("remote_api_token")),
+                                      wxDefaultPosition, wxSize(FromDIP(320), -1), wxTE_READONLY);
+
+    auto token_btn = new Button(m_parent, _L("Regenerate"));
+    token_btn->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+    token_btn->Bind(wxEVT_BUTTON, [this, token_value](wxCommandEvent &) {
+        auto tok = Slic3r::GUI::RemoteAPI::Config::generate_token();
+        app_config->set("remote_api_token", tok);
+        app_config->save();
+        token_value->SetValue(wxString(tok));
+        // Restart so the running server picks up the new token immediately.
+        wxGetApp().stop_remote_api();
+        wxGetApp().start_remote_api();
+    });
+
+    token_sizer->Add(token_label, 0, wxALIGN_CENTER_VERTICAL);
+    token_sizer->Add(token_value, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(5));
+    token_sizer->Add(token_btn,   0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(5));
+    g_sizer->Add(token_sizer);
+
+    g_sizer->AddSpacer(FromDIP(10));
+    sizer_page->Add(g_sizer, 0, wxEXPAND);
 }
 
 void PreferencesDialog::UpdateSidebarLayout()

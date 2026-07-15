@@ -101,6 +101,7 @@ public:
     wxBoxSizer *create_item_auto_reslice(wxString title, wxString checkbox_tooltip, wxString delay_tooltip);
     wxBoxSizer *create_item_draco(wxString title, wxString side_label, wxString tooltip);
     wxBoxSizer *create_item_multiple_combobox(wxString title, wxString tooltip, std::string parama, std::vector<wxString> vlista, std::vector<wxString> vlistb);
+    void create_remote_api_page(wxBoxSizer* sizer_page, int v_gap);
 #ifdef WIN32
     wxBoxSizer *create_item_link_association(wxString url_prefix, wxString website_name);
 #endif // WIN32

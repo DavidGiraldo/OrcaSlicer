@@ -1133,7 +1133,7 @@ void GUI_App::shutdown()
 	if (m_removable_drive_manager) {
 		removable_drive_manager()->shutdown();
 	}
-    stop_remote_api();
+    if (!m_is_recreating_gui) stop_remote_api();
 
     // destroy login dialog
     if (login_dlg != nullptr) {

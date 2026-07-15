@@ -24,19 +24,20 @@ public:
 private:
     void do_read()
     {
-        m_req = {};
         m_stream.expires_after(std::chrono::seconds(15));
-        http::async_read(m_stream, m_buffer, m_req,
+        m_parser.body_limit(4 * 1024 * 1024); // bound request body before buffering (unauthenticated clients)
+        http::async_read(m_stream, m_buffer, m_parser,
             [self = shared_from_this()](beast::error_code ec, std::size_t) {
-                if (ec) return; // closed / timeout / parse error
+                if (ec) return; // closed / timeout / parse error / body too large
                 self->handle();
             });
     }
 
     void handle()
     {
+        auto &req = m_parser.get();
         // Auth first, everything else second.
-        auto        tok_sv = m_req["X-Api-Token"];
+        auto        tok_sv = req["X-Api-Token"];
         std::string token(tok_sv.data(), tok_sv.size());
         Response    r;
         if (!m_server.check_token(token)) {
@@ -44,9 +45,9 @@ private:
         } else if (!m_server.handler()) {
             r = { 503, {{"error", "no_handler"}} };
         } else {
-            Request rq { std::string(m_req.method_string()),
-                         std::string(m_req.target()),
-                         m_req.body() };
+            Request rq { std::string(req.method_string()),
+                         std::string(req.target()),
+                         req.body() };
             try {
                 r = m_server.handler()(rq);
             } catch (const std::exception &e) {
@@ -55,13 +56,28 @@ private:
                 r = { 500, {{"error", "internal"}, {"detail", e.what()}} };
             }
         }
-        auto res = std::make_shared<http::response<http::string_body>>(
-            static_cast<http::status>(r.status), m_req.version());
-        res->set(http::field::content_type, "application/json");
-        res->set(http::field::server, "orca-remote-api");
-        res->keep_alive(false);
-        res->body() = r.body.dump();
-        res->prepare_payload();
+        // Build the response defensively: json::dump() can throw on malformed
+        // data (e.g. non-UTF-8 bytes), and this runs on the io thread where an
+        // uncaught exception would call std::terminate() and kill the slicer.
+        std::shared_ptr<http::response<http::string_body>> res;
+        try {
+            res = std::make_shared<http::response<http::string_body>>(
+                static_cast<http::status>(r.status), req.version());
+            res->set(http::field::content_type, "application/json");
+            res->set(http::field::server, "orca-remote-api");
+            res->keep_alive(false);
+            res->body() = r.body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            res->prepare_payload();
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(error) << "remote-api: response build exception: " << e.what();
+            res = std::make_shared<http::response<http::string_body>>(
+                http::status::internal_server_error, req.version());
+            res->set(http::field::content_type, "application/json");
+            res->set(http::field::server, "orca-remote-api");
+            res->keep_alive(false);
+            res->body() = "{\"error\":\"internal\"}";
+            res->prepare_payload();
+        }
         http::async_write(m_stream, *res,
             [self = shared_from_this(), res](beast::error_code, std::size_t) {
                 beast::error_code ec2;
@@ -69,10 +85,10 @@ private:
             });
     }
 
-    beast::tcp_stream                  m_stream;
-    beast::flat_buffer                 m_buffer;
-    http::request<http::string_body>   m_req;
-    Server                            &m_server;
+    beast::tcp_stream                          m_stream;
+    beast::flat_buffer                         m_buffer;
+    http::request_parser<http::string_body>    m_parser;
+    Server                                     &m_server;
 };
 
 void Server::start(const Config &cfg)

@@ -33,7 +33,7 @@ public:
 private:
     Response handle_status();
     Response handle_get_config(const std::string &target);
-    // Task 9:  Response handle_put_config(const std::string &body);
+    Response handle_put_config(const std::string &body);
     // Task 10: Response handle_slice(); Response handle_slice_status();
 
     // Runs fn on the GUI thread, blocks the calling (io) thread up to 10 s.

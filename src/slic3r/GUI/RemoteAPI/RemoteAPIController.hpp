@@ -30,11 +30,19 @@ public:
 
     SliceState slice_state() const { std::lock_guard<std::mutex> lk(m_mutex); return m_slice; }
 
+    // Call once on the GUI thread after the plater exists (from start_remote_api()).
+    // Idempotent: guarded by m_events_bound.
+    void bind_plater_events();
+
 private:
     Response handle_status();
     Response handle_get_config(const std::string &target);
     Response handle_put_config(const std::string &body);
-    // Task 10: Response handle_slice(); Response handle_slice_status();
+    Response handle_slice();
+    Response handle_slice_status();
+
+    // Mutate m_slice under the lock and broadcast a snapshot (event_name) to WS clients.
+    void set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name);
 
     // Runs fn on the GUI thread, blocks the calling (io) thread up to 10 s.
     // Throws std::runtime_error("ui_timeout") on expiry.
@@ -42,6 +50,7 @@ private:
 
     mutable std::mutex m_mutex;
     SliceState         m_slice;
+    bool               m_events_bound { false };
 };
 
 }}} // namespace

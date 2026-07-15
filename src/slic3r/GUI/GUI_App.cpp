@@ -6115,6 +6115,7 @@ void GUI_App::start_remote_api()
     if (!cfg.enabled) return;
     if (!m_remote_api_controller)
         m_remote_api_controller = std::make_unique<RemoteAPI::Controller>();
+    m_remote_api_controller->bind_plater_events();
     m_remote_api_server.set_handler([this](const RemoteAPI::Request &req) {
         return m_remote_api_controller->dispatch(req);
     });

@@ -7620,16 +7620,10 @@ void GUI_App::start_remote_api()
 {
     auto cfg = RemoteAPI::Config::load();
     if (!cfg.enabled) return;
-    m_remote_api_server.set_handler([](const RemoteAPI::Request &req) -> RemoteAPI::Response {
-        // Skeleton route table; replaced by the Controller in Task 8.
-        if (req.method == "GET" && req.target.rfind("/api/v1/status", 0) == 0)
-            return { 200, {
-                {"app", SLIC3R_APP_NAME},
-                {"app_version", SoftFever_VERSION},
-                {"api_version", "1.0"},
-                {"capabilities", {"status", "config", "slice", "events"}}
-            }};
-        return { 404, {{"error", "not_found"}} };
+    if (!m_remote_api_controller)
+        m_remote_api_controller = std::make_unique<RemoteAPI::Controller>();
+    m_remote_api_server.set_handler([this](const RemoteAPI::Request &req) {
+        return m_remote_api_controller->dispatch(req);
     });
     m_remote_api_server.start(cfg);
 }

@@ -101,7 +101,7 @@ Response Controller::handle_get_config(const std::string &target)
             start = comma + 1;
         }
     }
-    nlohmann::json j = run_on_ui([&keys]() -> nlohmann::json {
+    nlohmann::json j = run_on_ui([keys = std::move(keys)]() -> nlohmann::json {
         DynamicPrintConfig cfg = wxGetApp().preset_bundle->full_config_secure();
         return config_to_json(cfg, keys.empty() ? nullptr : &keys);
     });
@@ -118,7 +118,7 @@ Response Controller::dispatch(const Request &req)
         if (is("GET", "/api/v1/status"))       return handle_status();
         if (is("GET", "/api/v1/config"))       return handle_get_config(t);
         return { 404, {{"error", "not_found"}} };
-    } catch (const std::runtime_error &e) {
+    } catch (const std::exception &e) {
         if (std::string(e.what()) == "ui_timeout")
             return { 504, {{"error", "ui_timeout"}} };
         return { 500, {{"error", "internal"}, {"detail", e.what()}} };

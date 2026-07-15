@@ -1065,6 +1065,7 @@ void GUI_App::post_init()
            }
         }
     }
+    this->start_remote_api();
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
 //BBS: remove the single instance currently
 #ifdef _WIN32
@@ -1112,6 +1113,7 @@ void GUI_App::shutdown()
 	if (m_removable_drive_manager) {
 		removable_drive_manager()->shutdown();
 	}
+    stop_remote_api();
 
     // destroy login dialog
     if (login_dlg != nullptr) {
@@ -7520,6 +7522,29 @@ void GUI_App::stop_sync_user_preset()
         else
             m_sync_update_thread.detach();
     }
+}
+
+void GUI_App::start_remote_api()
+{
+    auto cfg = RemoteAPI::Config::load();
+    if (!cfg.enabled) return;
+    m_remote_api_server.set_handler([](const RemoteAPI::Request &req) -> RemoteAPI::Response {
+        // Skeleton route table; replaced by the Controller in Task 8.
+        if (req.method == "GET" && req.target.rfind("/api/v1/status", 0) == 0)
+            return { 200, {
+                {"app", SLIC3R_APP_NAME},
+                {"app_version", SoftFever_VERSION},
+                {"api_version", "1.0"},
+                {"capabilities", {"status", "config", "slice", "events"}}
+            }};
+        return { 404, {{"error", "not_found"}} };
+    });
+    m_remote_api_server.start(cfg);
+}
+
+void GUI_App::stop_remote_api()
+{
+    m_remote_api_server.stop();
 }
 
 void GUI_App::restart_sync_user_preset()

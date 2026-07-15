@@ -9,6 +9,9 @@
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Tab.hpp"
+#include "slic3r/GUI/BackgroundSlicingProcess.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/Print.hpp"
 
 #include <array>
 #include <future>
@@ -202,6 +205,104 @@ Response Controller::handle_put_config(const std::string &body)
     return { status, result };
 }
 
+void Controller::set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name)
+{
+    nlohmann::json snapshot;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        mut(m_slice);
+        snapshot = {{"event", event_name},
+                    {"state", m_slice.state},
+                    {"percent", m_slice.percent},
+                    {"message", m_slice.message}};
+        if (!m_slice.stats.is_null()) snapshot["stats"] = m_slice.stats;
+    }
+    wxGetApp().remote_api_server().broadcast(snapshot);
+}
+
+void Controller::bind_plater_events()
+{
+    if (m_events_bound) return;
+    m_events_bound = true;
+    Plater *plater = wxGetApp().plater();
+
+    plater->Bind(EVT_SLICING_UPDATE, [this](SlicingStatusEvent &evt) {
+        evt.Skip(); // REQUIRED: let the Plater's own handler run (bound earlier = runs after us)
+        if (evt.status.percent >= 0)
+            set_slice_state([&](SliceState &s) {
+                s.state   = "slicing";
+                s.percent = evt.status.percent;
+                s.message = evt.status.text;
+            }, "slice.progress");
+    });
+
+    plater->Bind(EVT_PROCESS_COMPLETED, [this](SlicingProcessCompletedEvent &evt) {
+        evt.Skip(); // REQUIRED (see above)
+        if (evt.error()) {
+            auto msg = evt.format_error_message();
+            set_slice_state([&](SliceState &s) {
+                s.state = "error"; s.percent = -1; s.message = msg.first;
+                s.stats = nullptr; s.warnings = nlohmann::json::array();
+            }, "slice.error");
+            return;
+        }
+        if (evt.cancelled()) {
+            set_slice_state([&](SliceState &s) {
+                s.state = "idle"; s.percent = -1; s.message = "cancelled";
+            }, "slice.cancelled");
+            return;
+        }
+        // Success: harvest stats on the GUI thread (we ARE on it — wx handler).
+        nlohmann::json stats, warnings = nlohmann::json::array();
+        auto &plates = wxGetApp().plater()->get_partplate_list();
+        const PrintStatistics &ps = plates.get_current_fff_print().print_statistics();
+        stats = {
+            {"estimated_time", ps.estimated_normal_print_time},
+            {"filament_used_mm", ps.total_used_filament},
+            {"filament_used_g", ps.total_weight},
+            {"total_cost", ps.total_cost}
+        };
+        if (GCodeProcessorResult *res = plates.get_curr_plate()->get_slice_result()) {
+            if (!res->print_statistics.modes.empty())
+                stats["estimated_time_seconds"] = res->print_statistics.modes.front().time;
+            for (const auto &w : res->warnings)
+                warnings.push_back({{"level", w.level}, {"message", w.msg}, {"code", w.error_code}});
+        }
+        set_slice_state([&](SliceState &s) {
+            s.state = "done"; s.percent = 100; s.message = "";
+            s.stats = stats; s.warnings = warnings;
+        }, "slice.done");
+    });
+}
+
+Response Controller::handle_slice()
+{
+    if (slice_state().state == "slicing")
+        return { 409, {{"error", "already_slicing"}} };
+    nlohmann::json r = run_on_ui([this]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        if (plater->model().objects.empty())
+            return {{"error", "nothing_to_slice"}};
+        set_slice_state([](SliceState &s) {
+            s.state = "slicing"; s.percent = 0; s.message = "starting";
+            s.stats = nullptr; s.warnings = nlohmann::json::array();
+        }, "slice.started");
+        plater->reslice();
+        return {{"started", true}};
+    });
+    if (r.contains("error")) return { 422, r };
+    return { 202, r };
+}
+
+Response Controller::handle_slice_status()
+{
+    SliceState s = slice_state();
+    nlohmann::json j = {{"state", s.state}, {"percent", s.percent}, {"message", s.message}};
+    if (!s.stats.is_null()) j["stats"] = s.stats;
+    j["warnings"] = s.warnings;
+    return { 200, j };
+}
+
 Response Controller::dispatch(const Request &req)
 {
     try {
@@ -218,6 +319,8 @@ Response Controller::dispatch(const Request &req)
                 return { 400, {{"error", "invalid_json"}} };
             }
         }
+        if (is("POST", "/api/v1/slice") && t == "/api/v1/slice") return handle_slice();
+        if (is("GET",  "/api/v1/slice/status"))                  return handle_slice_status();
         return { 404, {{"error", "not_found"}} };
     } catch (const std::exception &e) {
         if (std::string(e.what()) == "ui_timeout")

@@ -8567,6 +8567,10 @@ void GUI_App::open_preferences(PreferencesTab tab, const std::string& highlight_
         PreferencesDialog dlg(mainframe);
         dlg.select_tab(tab, highlight_option);
         dlg.ShowModal();
+        // Apply Remote API settings changed in the dialog (Task 7). Cheap and
+        // idempotent even if nothing Remote-API-related changed.
+        stop_remote_api();
+        start_remote_api(); // no-op if remote_api_enabled is false
         need_recreate_gui = dlg.recreate_GUI();
         pending_language = dlg.pending_language();
         if (!need_recreate_gui) {

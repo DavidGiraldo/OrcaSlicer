@@ -230,6 +230,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/HttpServer.hpp
     GUI/RemoteAPI/RemoteAPIConfig.cpp
     GUI/RemoteAPI/RemoteAPIConfig.hpp
+    GUI/RemoteAPI/RemoteAPIServer.cpp
+    GUI/RemoteAPI/RemoteAPIServer.hpp
     GUI/I18N.cpp
     GUI/I18N.hpp
     GUI/DragDropPanel.cpp

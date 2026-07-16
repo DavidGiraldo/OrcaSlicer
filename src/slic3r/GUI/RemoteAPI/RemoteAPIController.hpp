@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <mutex>
+#include <set>
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 
@@ -25,8 +26,14 @@ class Controller
 public:
     // Must be constructed on the GUI thread (binds wx events in Task 10).
     Controller();
+    ~Controller();
 
     Response dispatch(const Request &req);
+
+    // GUI-code hooks, callable even when the API is disabled (no-op when no
+    // controller exists). preset_type is int to keep Tab.cpp include-light.
+    static void notify_config_changed(int preset_type);
+    static void notify_project_opened();
 
     SliceState slice_state() const { std::lock_guard<std::mutex> lk(m_mutex); return m_slice; }
 
@@ -44,6 +51,9 @@ private:
     // Mutate m_slice under the lock and broadcast a snapshot (event_name) to WS clients.
     void set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name);
 
+    // Debounced config.changed emitter (GUI thread; mutex guards the pending set).
+    void on_config_changed(int preset_type);
+
     // Runs fn on the GUI thread, blocks the calling (io) thread up to 10 s.
     // Throws std::runtime_error("ui_timeout") on expiry.
     nlohmann::json run_on_ui(std::function<nlohmann::json()> fn);
@@ -51,6 +61,10 @@ private:
     mutable std::mutex m_mutex;
     SliceState         m_slice;
     bool               m_events_bound { false };
+
+    std::mutex         m_cc_mutex;
+    std::set<int>      m_cc_pending;
+    bool               m_cc_timer_armed { false };
 };
 
 }}} // namespace

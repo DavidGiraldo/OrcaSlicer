@@ -2,6 +2,12 @@
 #include "OrcaCloudServiceAgent.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
+// Boost.Asio-based RemoteAPI headers included BEFORE GUI_App.hpp (which pulls in
+// wx/windows.h) to preserve asio-before-windows.h ordering, and to supply the
+// full RemoteAPI::Server/Controller definitions this TU needs (they are only
+// forward-declared in GUI_App.hpp).
+#include "RemoteAPI/RemoteAPIServer.hpp"
+#include "RemoteAPI/RemoteAPIController.hpp"
 #include "GUI_App.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
@@ -1109,6 +1115,10 @@ GUI_App::GUI_App()
     , m_downloader(std::make_unique<Downloader>())
 	, m_other_instance_message_handler(std::make_unique<OtherInstanceMessageHandler>())
 {
+    // Owns the RemoteAPI server for the app lifetime (unique_ptr since the type
+    // is only forward-declared in the header). Always constructed; start() is
+    // deferred to start_remote_api() and only runs when the API is enabled.
+    m_remote_api_server = std::make_unique<RemoteAPI::Server>();
 	//app config initializes early becasuse it is used in instance checking in OrcaSlicer.cpp
     this->init_app_config();
     this->init_download_path();
@@ -7623,6 +7633,8 @@ void GUI_App::stop_sync_user_preset()
     }
 }
 
+RemoteAPI::Server &GUI_App::remote_api_server() { return *m_remote_api_server; }
+
 void GUI_App::start_remote_api()
 {
     auto cfg = RemoteAPI::Config::load();
@@ -7630,15 +7642,15 @@ void GUI_App::start_remote_api()
     if (!m_remote_api_controller)
         m_remote_api_controller = std::make_unique<RemoteAPI::Controller>();
     m_remote_api_controller->bind_plater_events();
-    m_remote_api_server.set_handler([this](const RemoteAPI::Request &req) {
+    m_remote_api_server->set_handler([this](const RemoteAPI::Request &req) {
         return m_remote_api_controller->dispatch(req);
     });
-    m_remote_api_server.start(cfg);
+    m_remote_api_server->start(cfg);
 }
 
 void GUI_App::stop_remote_api()
 {
-    m_remote_api_server.stop();
+    m_remote_api_server->stop();
 }
 
 void GUI_App::restart_sync_user_preset()

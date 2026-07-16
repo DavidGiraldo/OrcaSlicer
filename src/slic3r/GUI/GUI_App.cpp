@@ -4536,6 +4536,13 @@ void GUI_App::recreate_GUI(const wxString &msg_name)
 
     update_publish_status();
 
+    // Rebind the Remote API's slice-event subscriptions onto the freshly built
+    // plater (the old plater's Bind()s died with it). No-op if the API is off or
+    // already bound to this plater. The server itself keeps running across a
+    // recreate (shutdown() skips stop when m_is_recreating_gui), so WS clients
+    // are preserved.
+    if (m_remote_api_controller) m_remote_api_controller->bind_plater_events();
+
     m_is_recreating_gui = false;
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "recreate_GUI exit";

@@ -105,7 +105,9 @@ private:
         }
         // Auth first, everything else second.
         auto        tok_sv = req["X-Api-Token"];
-        std::string token(tok_sv.data(), tok_sv.size());
+        // iterator-pair ctor: safe when the header is absent (data() may be
+        // nullptr with size 0, which the (ptr,len) ctor treats as UB).
+        std::string token(tok_sv.begin(), tok_sv.end());
         Response    r;
         if (!m_server.check_token(token)) {
             r = { 401, {{"error", "unauthorized"}} };
@@ -145,6 +147,7 @@ private:
             res->body() = "{\"error\":\"internal\"}";
             res->prepare_payload();
         }
+        m_stream.expires_after(std::chrono::seconds(15)); // re-arm timeout for the write (slow-reader guard)
         http::async_write(m_stream, *res,
             [self = shared_from_this(), res](beast::error_code, std::size_t) {
                 beast::error_code ec2;
@@ -166,8 +169,14 @@ void Server::start(const Config &cfg)
         m_ioc = std::make_unique<net::io_context>(1);
         auto address = m_cfg.bind_lan ? net::ip::address_v4::any()
                                       : net::ip::make_address_v4("127.0.0.1");
-        m_acceptor = std::make_unique<tcp::acceptor>(
-            *m_ioc, tcp::endpoint(address, static_cast<unsigned short>(m_cfg.port)));
+        tcp::endpoint endpoint(address, static_cast<unsigned short>(m_cfg.port));
+        m_acceptor = std::make_unique<tcp::acceptor>(*m_ioc);
+        m_acceptor->open(endpoint.protocol());
+        // SO_REUSEADDR: rebind while a prior socket lingers in TIME_WAIT.
+        // Without it, a rapid kill+relaunch silently fails to bind 13130.
+        m_acceptor->set_option(net::socket_base::reuse_address(true));
+        m_acceptor->bind(endpoint);
+        m_acceptor->listen(net::socket_base::max_listen_connections);
     } catch (const std::exception &e) {
         BOOST_LOG_TRIVIAL(error) << "remote-api: failed to bind port " << m_cfg.port
                                  << ": " << e.what();
@@ -230,7 +239,17 @@ void Server::ws_leave(const std::shared_ptr<WsSession> &s)
 void Server::broadcast(const nlohmann::json &event)
 {
     if (!m_running || !m_ioc) return;
-    auto text = std::make_shared<std::string>(event.dump());
+    // dump() can throw on non-UTF-8 (project filenames, slice warnings carry raw
+    // bytes). This runs on the GUI thread; an uncaught throw could take the
+    // slicer down — same hazard the HTTP response path already guards against.
+    std::shared_ptr<std::string> text;
+    try {
+        text = std::make_shared<std::string>(
+            event.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(error) << "remote-api: broadcast dump failed: " << e.what();
+        return;
+    }
     net::post(*m_ioc, [this, text] {
         std::lock_guard<std::mutex> lk(m_ws_mutex);
         for (auto &s : m_ws_sessions) s->send(*text);

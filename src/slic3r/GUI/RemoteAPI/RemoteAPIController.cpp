@@ -14,6 +14,7 @@
 #include "libslic3r/Print.hpp"
 
 #include <array>
+#include <atomic>
 #include <future>
 #include <sstream>
 
@@ -56,26 +57,35 @@ void Controller::on_config_changed(int preset_type)
         }
         nlohmann::json tabs = nlohmann::json::array();
         for (int t : pending)
-            tabs.push_back(t == Preset::TYPE_PRINT    ? "print" :
-                           t == Preset::TYPE_FILAMENT ? "filament" :
-                           t == Preset::TYPE_PRINTER  ? "printer" : "other");
+            tabs.push_back(t == Preset::TYPE_PRINT        ? "print" :
+                           t == Preset::TYPE_FILAMENT     ? "filament" :
+                           t == Preset::TYPE_PRINTER      ? "printer" :
+                           t == Preset::TYPE_SLA_PRINT    ? "sla_print" :
+                           t == Preset::TYPE_SLA_MATERIAL ? "sla_material" : "other");
         wxGetApp().remote_api_server().broadcast({{"event", "config.changed"}, {"tabs", tabs}});
     });
 }
 
 nlohmann::json Controller::run_on_ui(std::function<nlohmann::json()> fn)
 {
-    auto promise = std::make_shared<std::promise<nlohmann::json>>();
-    auto future  = promise->get_future();
-    wxGetApp().CallAfter([promise, fn = std::move(fn)] {
+    auto promise   = std::make_shared<std::promise<nlohmann::json>>();
+    auto future    = promise->get_future();
+    // Set if the io side gives up (10s timeout) before the GUI lambda runs. The
+    // lambda checks it at the top, so a timed-out request does NOT still apply
+    // its side effects (PUT config / reslice) on the GUI thread afterwards.
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    wxGetApp().CallAfter([promise, cancelled, fn = std::move(fn)] {
+        if (cancelled->load()) return; // caller already returned 504; do nothing
         try {
             promise->set_value(fn());
         } catch (...) {
             promise->set_exception(std::current_exception());
         }
     });
-    if (future.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+    if (future.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        cancelled->store(true);
         throw std::runtime_error("ui_timeout");
+    }
     return future.get(); // rethrows GUI-side exceptions
 }
 
@@ -224,6 +234,11 @@ Response Controller::handle_put_config(const std::string &body)
             }
         }
 
+        // Atomic: if any key failed validation, apply NOTHING and report errors.
+        // (Previously, valid keys in a mixed batch applied before the 422.)
+        if (!errors.empty())
+            return {{"applied", nlohmann::json::array()}, {"errors", errors}};
+
         // Apply through the GUI's own path: dirty markers + live panel refresh.
         // Same idiom as PlaterPresetComboBox::change_extruder_color()
         // (PresetComboBoxes.cpp): load_config() diffs+sets+update_dirty()+
@@ -262,11 +277,18 @@ void Controller::set_slice_state(const std::function<void(SliceState&)> &mut, co
     wxGetApp().remote_api_server().broadcast(snapshot);
 }
 
+// Tracks which Plater the slice events are bound to. A GUI recreate (language/
+// skin switch) builds a NEW Plater and the old Bind()s die with it, so we must
+// rebind onto the new plater. File-static (only one Controller ever exists)
+// keeps this out of the header. See final whole-branch review.
+static Plater *s_bound_plater = nullptr;
+
 void Controller::bind_plater_events()
 {
-    if (m_events_bound) return;
-    m_events_bound = true;
     Plater *plater = wxGetApp().plater();
+    if (plater == nullptr || s_bound_plater == plater) return; // already bound to this plater
+    s_bound_plater = plater;
+    m_events_bound = true;
 
     plater->Bind(EVT_SLICING_UPDATE, [this](SlicingStatusEvent &evt) {
         evt.Skip(); // REQUIRED: let the Plater's own handler run (bound earlier = runs after us)
@@ -319,12 +341,18 @@ void Controller::bind_plater_events()
 
 Response Controller::handle_slice()
 {
-    if (slice_state().state == "slicing")
-        return { 409, {{"error", "already_slicing"}} };
+    // All checks + the state transition run on the GUI thread inside run_on_ui,
+    // so they are serialized (no TOCTOU between the guard and the state change).
     nlohmann::json r = run_on_ui([this]() -> nlohmann::json {
+        if (slice_state().state == "slicing")
+            return {{"error", "already_slicing"}};
         Plater *plater = wxGetApp().plater();
         if (plater->model().objects.empty())
             return {{"error", "nothing_to_slice"}};
+        // reslice() no-ops on an already-valid plate -> no completion event ->
+        // status would stick at "slicing". Report the existing result instead.
+        if (plater->get_partplate_list().get_curr_plate()->is_slice_result_valid())
+            return {{"started", false}, {"already_valid", true}};
         set_slice_state([](SliceState &s) {
             s.state = "slicing"; s.percent = 0; s.message = "starting";
             s.stats = nullptr; s.warnings = nlohmann::json::array();
@@ -332,7 +360,11 @@ Response Controller::handle_slice()
         plater->reslice();
         return {{"started", true}};
     });
-    if (r.contains("error")) return { 422, r };
+    if (r.contains("error")) {
+        if (r["error"] == "already_slicing") return { 409, r };
+        return { 422, r };
+    }
+    if (r.value("already_valid", false)) return { 200, r };
     return { 202, r };
 }
 
@@ -349,11 +381,15 @@ Response Controller::dispatch(const Request &req)
 {
     try {
         const std::string &t = req.target;
+        // Match method + exact path, allowing only a query string after it
+        // (so /api/v1/statuses does NOT prefix-match /api/v1/status).
         auto is = [&](const char *m, const char *path) {
-            return req.method == m && t.rfind(path, 0) == 0;
+            if (req.method != m) return false;
+            size_t n = std::char_traits<char>::length(path);
+            return t.compare(0, n, path) == 0 && (t.size() == n || t[n] == '?');
         };
-        if (is("GET", "/api/v1/status"))       return handle_status();
-        if (is("GET", "/api/v1/config"))       return handle_get_config(t);
+        if (is("GET", "/api/v1/status"))        return handle_status();
+        if (is("GET", "/api/v1/config"))        return handle_get_config(t);
         if (is("PUT", "/api/v1/config")) {
             try {
                 return handle_put_config(req.body);
@@ -361,8 +397,8 @@ Response Controller::dispatch(const Request &req)
                 return { 400, {{"error", "invalid_json"}} };
             }
         }
-        if (is("POST", "/api/v1/slice") && t == "/api/v1/slice") return handle_slice();
-        if (is("GET",  "/api/v1/slice/status"))                  return handle_slice_status();
+        if (is("POST", "/api/v1/slice"))        return handle_slice();
+        if (is("GET",  "/api/v1/slice/status")) return handle_slice_status();
         return { 404, {{"error", "not_found"}} };
     } catch (const std::exception &e) {
         if (std::string(e.what()) == "ui_timeout")

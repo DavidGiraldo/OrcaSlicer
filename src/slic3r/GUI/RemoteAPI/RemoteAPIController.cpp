@@ -19,7 +19,49 @@
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 
-Controller::Controller() = default; // event Binds arrive in Task 10
+static Controller *g_controller = nullptr; // set in ctor, cleared in dtor
+
+Controller::Controller()  { g_controller = this; }
+Controller::~Controller() { g_controller = nullptr; }
+
+void Controller::notify_config_changed(int preset_type)
+{
+    if (g_controller) g_controller->on_config_changed(preset_type);
+}
+
+void Controller::notify_project_opened()
+{
+    if (g_controller == nullptr) return;
+    // On the GUI thread at the end of Plater::load_project.
+    std::string name = wxGetApp().plater()->get_project_filename().ToUTF8().data();
+    wxGetApp().remote_api_server().broadcast({{"event", "project.opened"}, {"project", name}});
+}
+
+void Controller::on_config_changed(int preset_type)
+{
+    // Called on the GUI thread from Tab::update_dirty. Debounce one event-loop
+    // turn: GUI edits and load_config fire this repeatedly.
+    {
+        std::lock_guard<std::mutex> lk(m_cc_mutex);
+        m_cc_pending.insert(preset_type);
+        if (m_cc_timer_armed) return;
+        m_cc_timer_armed = true;
+    }
+    wxGetApp().CallAfter([this] {
+        std::set<int> pending;
+        {
+            std::lock_guard<std::mutex> lk(m_cc_mutex);
+            pending.swap(m_cc_pending);
+            m_cc_timer_armed = false;
+        }
+        nlohmann::json tabs = nlohmann::json::array();
+        for (int t : pending)
+            tabs.push_back(t == Preset::TYPE_PRINT    ? "print" :
+                           t == Preset::TYPE_FILAMENT ? "filament" :
+                           t == Preset::TYPE_PRINTER  ? "printer" : "other");
+        wxGetApp().remote_api_server().broadcast({{"event", "config.changed"}, {"tabs", tabs}});
+    });
+}
 
 nlohmann::json Controller::run_on_ui(std::function<nlohmann::json()> fn)
 {

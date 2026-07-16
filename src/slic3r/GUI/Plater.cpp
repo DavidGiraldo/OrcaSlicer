@@ -1,6 +1,7 @@
 #include "Plater.hpp"
 #include "../Utils/NetworkAgent.hpp"
 #include "../Utils/NetworkAgentFactory.hpp"
+#include "RemoteAPI/RemoteAPIController.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r_version.h"
 
@@ -13238,6 +13239,9 @@ void Plater::load_project(wxString const& filename2,
     sidebar().set_flushing_volume_warning(has_modify);
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " load project done";
+    // m_loading_project is cleared by the ScopeGuard at the top of this function
+    // upstream now, so only the notification is carried over from the patch.
+    Slic3r::GUI::RemoteAPI::Controller::notify_project_opened();
 }
 
 // BBS: save logic

@@ -3,6 +3,7 @@
 
 #include "libslic3r/Thread.hpp"
 #include <boost/log/trivial.hpp>
+#include <deque>
 
 namespace beast = boost::beast;
 namespace http  = beast::http;
@@ -10,6 +11,59 @@ namespace net   = boost::asio;
 using tcp       = net::ip::tcp;
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
+
+// One WebSocket connection. All socket I/O runs on the single io thread.
+class WsSession : public std::enable_shared_from_this<WsSession>
+{
+public:
+    WsSession(tcp::socket socket, Server &server)
+        : m_ws(std::move(socket)), m_server(server) {}
+
+    void run(http::request<http::string_body> req)
+    {
+        m_ws.set_option(beast::websocket::stream_base::timeout::suggested(beast::role_type::server));
+        // beast requires the upgrade request to stay valid until async_accept
+        // completes, so keep it alive in a shared_ptr captured by the handler.
+        auto req_held = std::make_shared<http::request<http::string_body>>(std::move(req));
+        m_ws.async_accept(*req_held, [self = shared_from_this(), req_held](beast::error_code ec) {
+            if (ec) return;
+            self->m_server.ws_join(self);
+            self->do_read();
+        });
+    }
+
+    // Called on the io thread (via net::post in Server::broadcast).
+    void send(const std::string &text)
+    {
+        m_queue.push_back(text);
+        if (m_queue.size() == 1) do_write();
+    }
+
+private:
+    void do_read()
+    { // inbound messages are ignored; the read just detects disconnect
+        m_ws.async_read(m_buffer, [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec) { self->m_server.ws_leave(self); return; }
+            self->m_buffer.consume(self->m_buffer.size());
+            self->do_read();
+        });
+    }
+    void do_write()
+    {
+        m_ws.text(true);
+        m_ws.async_write(net::buffer(m_queue.front()),
+            [self = shared_from_this()](beast::error_code ec, std::size_t) {
+                if (ec) { self->m_server.ws_leave(self); return; }
+                self->m_queue.pop_front();
+                if (!self->m_queue.empty()) self->do_write();
+            });
+    }
+
+    beast::websocket::stream<beast::tcp_stream> m_ws;
+    beast::flat_buffer                          m_buffer;
+    std::deque<std::string>                     m_queue;
+    Server                                     &m_server;
+};
 
 // One HTTP connection. Reads a request, answers it, closes (Connection: close).
 class HttpSession : public std::enable_shared_from_this<HttpSession>
@@ -36,6 +90,19 @@ private:
     void handle()
     {
         auto &req = m_parser.get();
+        // WebSocket upgrade path: auth via ?token= query param (browser WS
+        // clients can't set request headers). Runs before token-header auth.
+        if (beast::websocket::is_upgrade(req)) {
+            std::string target = std::string(req.target());
+            auto        tpos   = target.find("token=");
+            std::string wtok   = (tpos == std::string::npos) ? std::string() : target.substr(tpos + 6);
+            if (auto amp = wtok.find('&'); amp != std::string::npos) wtok.resize(amp);
+            if (target.rfind("/api/v1/events", 0) == 0 && m_server.check_token(wtok)) {
+                std::make_shared<WsSession>(m_stream.release_socket(), m_server)->run(req);
+                return;
+            }
+            // otherwise fall through to the normal 401/404 JSON response
+        }
         // Auth first, everything else second.
         auto        tok_sv = req["X-Api-Token"];
         std::string token(tok_sv.data(), tok_sv.size());
@@ -162,7 +229,12 @@ void Server::ws_leave(const std::shared_ptr<WsSession> &s)
 }
 void Server::broadcast(const nlohmann::json &event)
 {
-    (void) event; // Task 11 fills this in once WsSession exists.
+    if (!m_running || !m_ioc) return;
+    auto text = std::make_shared<std::string>(event.dump());
+    net::post(*m_ioc, [this, text] {
+        std::lock_guard<std::mutex> lk(m_ws_mutex);
+        for (auto &s : m_ws_sessions) s->send(*text);
+    });
 }
 
 }}} // namespace

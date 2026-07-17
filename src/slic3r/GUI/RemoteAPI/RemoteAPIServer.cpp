@@ -132,10 +132,15 @@ private:
         try {
             res = std::make_shared<http::response<http::string_body>>(
                 static_cast<http::status>(r.status), req.version());
-            res->set(http::field::content_type, "application/json");
             res->set(http::field::server, "orca-remote-api");
             res->keep_alive(false);
-            res->body() = r.body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            if (r.raw_body) {
+                res->set(http::field::content_type, r.raw_content_type);
+                res->body() = *r.raw_body;
+            } else {
+                res->set(http::field::content_type, "application/json");
+                res->body() = r.body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            }
             res->prepare_payload();
         } catch (const std::exception &e) {
             BOOST_LOG_TRIVIAL(error) << "remote-api: response build exception: " << e.what();

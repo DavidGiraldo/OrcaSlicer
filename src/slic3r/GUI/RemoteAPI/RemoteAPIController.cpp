@@ -8,6 +8,7 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
+#include "libslic3r/Model.hpp"    // M4b: ModelObject/ModelInstance for GET /objects
 #include "slic3r/GUI/Tab.hpp"
 #include "slic3r/GUI/BackgroundSlicingProcess.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
@@ -129,7 +130,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -507,6 +508,41 @@ Response Controller::handle_get_gcode()
     return r;
 }
 
+
+Response Controller::handle_get_objects()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        nlohmann::json objects = nlohmann::json::array();
+        const Model &model = plater->model();
+        for (size_t i = 0; i < model.objects.size(); ++i) {
+            const ModelObject *mo = model.objects[i];
+            auto sz = mo->bounding_box_exact().size();
+            nlohmann::json o = {
+                {"id", (uint64_t) mo->id().id},
+                {"index", i},
+                {"name", mo->name},
+                {"size_mm", {sz.x(), sz.y(), sz.z()}},
+                {"instances", (unsigned) mo->instances.size()},
+            };
+            if (!mo->instances.empty()) {
+                const ModelInstance *mi = mo->instances.front();
+                auto off = mi->get_offset();
+                auto rot = mi->get_rotation();
+                auto scl = mi->get_scaling_factor();
+                o["transform"] = {
+                    {"offset",   {off.x(), off.y(), off.z()}},
+                    {"rotation", {rot.x(), rot.y(), rot.z()}},
+                    {"scale",    {scl.x(), scl.y(), scl.z()}},
+                };
+            }
+            objects.push_back(std::move(o));
+        }
+        return {{"objects", objects}, {"count", model.objects.size()}};
+    });
+    return { 200, r };
+}
+
 Response Controller::dispatch(const Request &req)
 {
     try {
@@ -544,6 +580,7 @@ Response Controller::dispatch(const Request &req)
             }
         }
         if (is("GET",  "/api/v1/gcode"))        return handle_get_gcode();
+        if (is("GET",  "/api/v1/objects"))      return handle_get_objects();
         return { 404, {{"error", "not_found"}} };
     } catch (const std::exception &e) {
         if (std::string(e.what()) == "ui_timeout")

@@ -15,7 +15,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <string>
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 
@@ -28,8 +30,13 @@ struct Request
 
 struct Response
 {
-    int            status { 200 };
-    nlohmann::json body;
+    int                        status { 200 };
+    nlohmann::json             body;
+    // If set, sent verbatim with raw_content_type instead of JSON-dumping `body`
+    // (used by GET /gcode to return the raw G-code file). Defaults keep every
+    // other handler's JSON behavior byte-for-byte unchanged.
+    std::optional<std::string> raw_body;
+    std::string                raw_content_type { "application/octet-stream" };
 };
 
 class WsSession; // Task 11

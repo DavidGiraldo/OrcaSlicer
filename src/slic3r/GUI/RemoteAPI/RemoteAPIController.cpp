@@ -12,11 +12,17 @@
 #include "slic3r/GUI/BackgroundSlicingProcess.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp" // LoadStrategy (used by Plater::load_files)
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <fstream>
 #include <future>
 #include <sstream>
+
+#include <boost/filesystem.hpp>
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 
@@ -123,7 +129,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -377,6 +383,130 @@ Response Controller::handle_slice_status()
     return { 200, j };
 }
 
+// M4a: POST /api/v1/model  body {"path":"<orca-host path>"}
+// v1 accepts only .stl/.obj/.3mf (loaded via LoadStrategy::LoadModel, no embedded
+// config). Other formats (esp. STEP) are rejected because their import path can pop
+// modal GUI dialogs that would wedge the single GUI thread with no remote way to dismiss.
+Response Controller::handle_load_model(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch route
+    if (!in.is_object() || !in.contains("path") || !in["path"].is_string())
+        return { 400, {{"error", "missing_path"}} };
+    std::string path = in["path"].get<std::string>();
+
+    std::string lower = path;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return (char) std::tolower(c); });
+    auto ends_with = [&lower](const char *suf) {
+        size_t n = std::char_traits<char>::length(suf);
+        return lower.size() >= n && lower.compare(lower.size() - n, n, suf) == 0;
+    };
+    if (!(ends_with(".stl") || ends_with(".obj") || ends_with(".3mf")))
+        return { 422, {{"error", "unsupported_format"},
+                       {"detail", "remote load supports .stl, .obj, .3mf (v1)"}} };
+
+    nlohmann::json r = run_on_ui([path]() -> nlohmann::json {
+        if (!boost::filesystem::exists(path))
+            return {{"error", "not_found"}};
+        Plater *plater = wxGetApp().plater();
+        std::vector<size_t> idxs = plater->load_files(std::vector<std::string>{ path },
+                                                      LoadStrategy::LoadModel);
+        if (idxs.empty())
+            return {{"error", "load_failed"}};
+        nlohmann::json objects = nlohmann::json::array();
+        for (size_t i : idxs) {
+            const ModelObject *mo = plater->model().objects[i];
+            auto sz = mo->bounding_box_exact().size();
+            objects.push_back({{"index", i}, {"name", mo->name},
+                               {"size_mm", {sz.x(), sz.y(), sz.z()}}});
+        }
+        return {{"loaded", true}, {"objects", objects}};
+    });
+    if (r.contains("error")) {
+        if (r["error"] == "not_found") return { 404, r };
+        return { 422, r };
+    }
+    return { 200, r };
+}
+
+// M4a: PUT /api/v1/preset  body {"type":"print|filament|printer","name":"..."}
+Response Controller::handle_select_preset(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object() || !in.contains("type") || !in.contains("name")
+        || !in["type"].is_string() || !in["name"].is_string())
+        return { 400, {{"error", "missing_fields"}} };
+    std::string type_s = in["type"].get<std::string>();
+    std::string name   = in["name"].get<std::string>();
+    Preset::Type type = type_s == "print"    ? Preset::TYPE_PRINT :
+                        type_s == "filament" ? Preset::TYPE_FILAMENT :
+                        type_s == "printer"  ? Preset::TYPE_PRINTER : Preset::TYPE_INVALID;
+    if (type == Preset::TYPE_INVALID)
+        return { 400, {{"error", "unknown_type"}} };
+
+    nlohmann::json r = run_on_ui([type, name]() -> nlohmann::json {
+        auto *bundle = wxGetApp().preset_bundle;
+        PresetCollection &presets = type == Preset::TYPE_PRINT    ? bundle->prints :
+                                    type == Preset::TYPE_FILAMENT ? bundle->filaments :
+                                                                    bundle->printers;
+        // Validate up front: select_preset silently falls back to a visible preset
+        // for an unknown name, so its return can't be trusted for a 422.
+        if (presets.find_preset(name, false, true) == nullptr)
+            return {{"error", "unknown_preset"}};
+        Tab *tab = wxGetApp().get_tab(type);
+        if (tab == nullptr) return {{"error", "tab_unavailable"}};
+        // Discard un-applied GUI edits on EVERY collection Tab::select_preset may
+        // inspect. It consults dependent tabs too (switching a print/printer preset
+        // checks the filament/print collections' dirty state), and ANY dirty one
+        // pops a modal UnsavedChangesDialog that would wedge the GUI thread with no
+        // remote way to dismiss it. Discarding is acceptable for an automation API
+        // (callers apply changes deliberately via PUT /config).
+        auto discard_if_dirty = [](PresetCollection &c) {
+            if (c.current_is_dirty()) c.discard_current_changes();
+        };
+        discard_if_dirty(bundle->prints);
+        discard_if_dirty(bundle->filaments);
+        discard_if_dirty(bundle->sla_materials);
+        discard_if_dirty(bundle->printers);
+        bool ok = tab->select_preset(name, false, "", /*force_select=*/true, /*force_no_transfer=*/true);
+        if (!ok) return {{"error", "select_cancelled"}};
+        return {{"selected", name}};
+    });
+    if (r.contains("error")) {
+        if (r["error"] == "unknown_preset") return { 422, r };
+        return { 500, r };
+    }
+    return { 200, r };
+}
+
+// M4a: GET /api/v1/gcode  -> raw G-code of the current plate's last successful slice
+Response Controller::handle_get_gcode()
+{
+    nlohmann::json meta = run_on_ui([]() -> nlohmann::json {
+        PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+        if (!plate->is_slice_result_valid())
+            return {{"error", "not_sliced"}};
+        GCodeProcessorResult *res = plate->get_slice_result();
+        if (res == nullptr || res->filename.empty())
+            return {{"error", "not_sliced"}};
+        return {{"path", res->filename}};
+    });
+    if (meta.contains("error"))
+        return { 409, meta };
+    // Read off the GUI thread (only the state lookup above needed it).
+    std::string path = meta["path"].get<std::string>();
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return { 500, {{"error", "gcode_file_missing"}} };
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    Response r;
+    r.status = 200;
+    r.raw_body = ss.str();
+    r.raw_content_type = "text/plain";
+    return r;
+}
+
 Response Controller::dispatch(const Request &req)
 {
     try {
@@ -399,6 +529,21 @@ Response Controller::dispatch(const Request &req)
         }
         if (is("POST", "/api/v1/slice"))        return handle_slice();
         if (is("GET",  "/api/v1/slice/status")) return handle_slice_status();
+        if (is("POST", "/api/v1/model")) {
+            try {
+                return handle_load_model(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
+        if (is("PUT", "/api/v1/preset")) {
+            try {
+                return handle_select_preset(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
+        if (is("GET",  "/api/v1/gcode"))        return handle_get_gcode();
         return { 404, {{"error", "not_found"}} };
     } catch (const std::exception &e) {
         if (std::string(e.what()) == "ui_timeout")

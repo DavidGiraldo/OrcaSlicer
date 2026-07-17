@@ -50,6 +50,7 @@ private:
     Response handle_load_model(const std::string &body);   // M4a: POST /model
     Response handle_select_preset(const std::string &body); // M4a: PUT /preset
     Response handle_get_gcode();                            // M4a: GET /gcode (raw body)
+    Response handle_get_objects();                          // M4b: GET /objects
 
     // Mutate m_slice under the lock and broadcast a snapshot (event_name) to WS clients.
     void set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name);

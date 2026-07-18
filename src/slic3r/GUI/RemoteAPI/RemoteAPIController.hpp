@@ -49,6 +49,12 @@ private:
     Response handle_slice_status();
     Response handle_load_model(const std::string &body);   // M4a: POST /model
     Response handle_select_preset(const std::string &body); // M4a: PUT /preset
+    Response handle_save_preset(const std::string &body);   // POST /preset/save
+    Response handle_get_presets();                          // GET /presets
+    Response handle_get_preset_config(const std::string &body); // POST /preset/config (read named preset)
+    Response handle_delete_preset(const std::string &body);      // DELETE /preset
+    Response handle_put_layer_height(uint64_t id, const std::string &body);  // M4c: PUT /objects/{id}/layer_height
+    Response handle_put_height_range(uint64_t id, const std::string &body);  // M4c: PUT /objects/{id}/height_range
     Response handle_get_gcode();                            // M4a: GET /gcode (raw body)
     Response handle_get_objects();                          // M4b: GET /objects
     Response handle_delete_object(uint64_t id);             // M4b: DELETE /objects/{id}

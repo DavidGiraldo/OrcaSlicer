@@ -130,7 +130,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -543,6 +543,103 @@ Response Controller::handle_get_objects()
     return { 200, r };
 }
 
+
+static int find_object_index(const Model &model, uint64_t id)
+{
+    for (size_t i = 0; i < model.objects.size(); ++i)
+        if ((uint64_t) model.objects[i]->id().id == id)
+            return (int) i;
+    return -1;
+}
+
+Response Controller::handle_delete_object(uint64_t id)
+{
+    nlohmann::json r = run_on_ui([id]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        int idx = find_object_index(plater->model(), id);
+        if (idx < 0) return {{"error", "unknown_object"}};
+        plater->remove((size_t) idx);
+        return {{"deleted", true}, {"id", id}, {"count", plater->model().objects.size()}};
+    });
+    if (r.contains("error")) return { 404, r };
+    return { 200, r };
+}
+
+Response Controller::handle_transform_object(uint64_t id, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+    if (!in.is_object()) return { 400, {{"error", "body_must_be_object"}} };
+    auto read_vec = [&in](const char *k, bool &present) -> Vec3d {
+        present = in.contains(k) && in[k].is_array() && in[k].size() == 3;
+        if (!present) return Vec3d(0, 0, 0);
+        return Vec3d(in[k][0].get<double>(), in[k][1].get<double>(), in[k][2].get<double>());
+    };
+    bool has_t = false, has_r = false, has_s = false;
+    Vec3d tr = read_vec("translate", has_t);
+    Vec3d ro = read_vec("rotate", has_r);   // degrees
+    Vec3d sc = read_vec("scale", has_s);     // absolute factor
+    if (!has_t && !has_r && !has_s)
+        return { 400, {{"error", "no_transform"},
+                       {"detail", "provide translate (mm), rotate (deg), and/or scale (factor)"}} };
+
+    nlohmann::json r = run_on_ui([=]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        int idx = find_object_index(plater->model(), id);
+        if (idx < 0) return {{"error", "unknown_object"}};
+        ModelObject *mo = plater->model().objects[idx];
+        if (mo->instances.empty()) return {{"error", "no_instance"}};
+        ModelInstance *mi = mo->instances.front();
+        if (has_t) mi->set_offset(mi->get_offset() + tr);
+        if (has_r) mi->set_rotation(mi->get_rotation() + ro * 0.017453292519943295); // deg->rad
+        if (has_s) mi->set_scaling_factor(sc);
+        plater->changed_object(idx);
+        auto off = mi->get_offset(); auto rot = mi->get_rotation(); auto scl = mi->get_scaling_factor();
+        return {{"id", id}, {"transform", {
+            {"offset",   {off.x(), off.y(), off.z()}},
+            {"rotation", {rot.x(), rot.y(), rot.z()}},
+            {"scale",    {scl.x(), scl.y(), scl.z()}}}}};
+    });
+    if (r.contains("error")) return { 404, r };
+    return { 200, r };
+}
+
+Response Controller::handle_arrange()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        if (plater->model().objects.empty()) return {{"error", "empty"}};
+        if (!plater->get_ui_job_worker().is_idle()) return {{"busy", true}};
+        plater->arrange();
+        return {{"started", true}};
+    });
+    if (r.contains("error")) return { 422, r };
+    if (r.value("busy", false)) return { 409, {{"error", "job_running"}} };
+    return { 202, r };
+}
+
+Response Controller::handle_orient()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        if (plater->model().objects.empty()) return {{"error", "empty"}};
+        if (!plater->get_ui_job_worker().is_idle()) return {{"busy", true}};
+        plater->orient();
+        return {{"started", true}};
+    });
+    if (r.contains("error")) return { 422, r };
+    if (r.value("busy", false)) return { 409, {{"error", "job_running"}} };
+    return { 202, r };
+}
+
+Response Controller::handle_jobs_status()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        return {{"idle", plater->get_ui_job_worker().is_idle()}};
+    });
+    return { 200, r };
+}
+
 Response Controller::dispatch(const Request &req)
 {
     try {
@@ -581,6 +678,30 @@ Response Controller::dispatch(const Request &req)
         }
         if (is("GET",  "/api/v1/gcode"))        return handle_get_gcode();
         if (is("GET",  "/api/v1/objects"))      return handle_get_objects();
+        if (is("POST", "/api/v1/arrange"))      return handle_arrange();
+        if (is("POST", "/api/v1/orient"))       return handle_orient();
+        if (is("GET",  "/api/v1/jobs/status"))  return handle_jobs_status();
+        {
+            // M4b object sub-routes: /api/v1/objects/<id> and /api/v1/objects/<id>/<action>
+            static const std::string pfx = "/api/v1/objects/";
+            std::string path = t.substr(0, t.find('?'));
+            if (path.size() > pfx.size() && path.compare(0, pfx.size(), pfx) == 0) {
+                std::string rest = path.substr(pfx.size());
+                size_t slash = rest.find('/');
+                std::string id_str = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+                std::string action = (slash == std::string::npos) ? std::string() : rest.substr(slash + 1);
+                uint64_t oid = 0;
+                try { oid = std::stoull(id_str); }
+                catch (...) { return { 400, {{"error", "bad_object_id"}} }; }
+                if (req.method == "DELETE" && action.empty())
+                    return handle_delete_object(oid);
+                if (req.method == "POST" && action == "transform") {
+                    try { return handle_transform_object(oid, req.body); }
+                    catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+                }
+                return { 404, {{"error", "not_found"}} };
+            }
+        }
         return { 404, {{"error", "not_found"}} };
     } catch (const std::exception &e) {
         if (std::string(e.what()) == "ui_timeout")

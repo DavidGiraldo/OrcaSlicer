@@ -174,7 +174,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -705,6 +705,41 @@ Response Controller::handle_duplicate_object(uint64_t id)
     return { 200, r };
 }
 
+Response Controller::handle_put_object_config(uint64_t id, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+    if (!in.is_object())
+        return { 400, {{"error", "body_must_be_object"}} };
+    nlohmann::json r = run_on_ui([id, in]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        int idx = find_object_index(plater->model(), id);
+        if (idx < 0) return {{"error", "unknown_object"}};
+        ModelObject *mo = plater->model().objects[idx];
+        DynamicPrintConfig cfg = mo->config.get(); // copy of existing per-object overrides
+        nlohmann::json applied = nlohmann::json::array();
+        nlohmann::json errors  = nlohmann::json::object();
+        for (auto it = in.begin(); it != in.end(); ++it) {
+            const std::string &key = it.key();
+            if (print_config_def.get(key) == nullptr) { errors[key] = "unknown_key"; continue; }
+            try {
+                cfg.set_deserialize_strict(key, json_value_to_config_string(it.value()));
+                applied.push_back(key);
+            } catch (const std::exception &e) { errors[key] = e.what(); }
+        }
+        if (!errors.empty()) { // atomic: apply nothing on any error
+            api_notify(std::string("Couldn't set object settings on '") + mo->name + "'", true);
+            return {{"applied", nlohmann::json::array()}, {"errors", errors}};
+        }
+        mo->config.assign_config(std::move(cfg));
+        plater->changed_object(idx);
+        if (!applied.empty())
+            api_notify("Updated " + std::to_string(applied.size()) + " setting(s) on '" + mo->name + "'");
+        return {{"applied", applied}, {"errors", errors}, {"object", mo->name}};
+    });
+    if (r.contains("error")) return { 404, r };
+    return { r["errors"].empty() ? 200 : 422, r };
+}
+
 Response Controller::handle_arrange()
 {
     nlohmann::json r = run_on_ui([]() -> nlohmann::json {
@@ -803,6 +838,10 @@ Response Controller::dispatch(const Request &req)
                 }
                 if (req.method == "POST" && action == "duplicate")
                     return handle_duplicate_object(oid);
+                if (req.method == "PUT" && action == "config") {
+                    try { return handle_put_object_config(oid, req.body); }
+                    catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+                }
                 return { 404, {{"error", "not_found"}} };
             }
         }

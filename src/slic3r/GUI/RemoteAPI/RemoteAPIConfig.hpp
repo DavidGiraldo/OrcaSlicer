@@ -12,6 +12,7 @@ struct Config
     bool        enabled  { false };
     int         port     { 13130 };
     bool        bind_lan { false };
+    bool        notify   { true };  // toast in-app when the API changes state
     std::string token;
 
     static Config      load();

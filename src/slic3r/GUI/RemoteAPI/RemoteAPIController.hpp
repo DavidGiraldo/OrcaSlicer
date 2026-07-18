@@ -53,6 +53,7 @@ private:
     Response handle_get_objects();                          // M4b: GET /objects
     Response handle_delete_object(uint64_t id);             // M4b: DELETE /objects/{id}
     Response handle_transform_object(uint64_t id, const std::string &body); // M4b: POST /objects/{id}/transform
+    Response handle_duplicate_object(uint64_t id);          // M4b: POST /objects/{id}/duplicate
     Response handle_arrange();                              // M4b: POST /arrange (async)
     Response handle_orient();                               // M4b: POST /orient (async)
     Response handle_jobs_status();                          // M4b: GET /jobs/status

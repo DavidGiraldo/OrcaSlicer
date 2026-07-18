@@ -9,6 +9,8 @@
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/Model.hpp"    // M4b: ModelObject/ModelInstance for GET /objects
+#include "slic3r/GUI/NotificationManager.hpp" // in-app change notifications
+#include "libslic3r/AppConfig.hpp"             // remote_api_notify toggle
 #include "slic3r/GUI/Tab.hpp"
 #include "slic3r/GUI/BackgroundSlicingProcess.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
@@ -22,6 +24,7 @@
 #include <fstream>
 #include <future>
 #include <sstream>
+#include <vector>
 
 #include <boost/filesystem.hpp>
 
@@ -31,6 +34,47 @@ static Controller *g_controller = nullptr; // set in ctor, cleared in dtor
 
 Controller::Controller()  { g_controller = this; }
 Controller::~Controller() { g_controller = nullptr; }
+
+// --- in-app notifications for API-driven changes -----------------------------
+// Gated by the remote_api_notify setting (default on). Thread-agnostic: marshals
+// to the GUI thread via CallAfter, so it is safe from io threads and from inside
+// run_on_ui alike. Deliberately NOT used for slice / arrange / orient - Orca's
+// own progress + result notifications already cover those (avoid double-up).
+static void api_notify(const std::string &text, bool warning = false)
+{
+    wxGetApp().CallAfter([text, warning]() {
+        auto *ac = wxGetApp().app_config;
+        bool enabled = (ac && ac->has("remote_api_notify")) ? ac->get_bool("remote_api_notify") : true;
+        if (!enabled) return;
+        Plater *plater = wxGetApp().plater();
+        if (plater == nullptr) return;
+        NotificationManager *nm = plater->get_notification_manager();
+        if (nm == nullptr) return;
+        // "Turn off" hypertext: one click disables future API notifications.
+        auto turn_off = [](wxEvtHandler *) -> bool {
+            auto *ac2 = wxGetApp().app_config;
+            if (ac2) { ac2->set_bool("remote_api_notify", false); ac2->save(); }
+            return true; // also dismisses this toast
+        };
+        nm->push_notification(NotificationType::CustomNotification,
+            warning ? NotificationManager::NotificationLevel::WarningNotificationLevel
+                    : NotificationManager::NotificationLevel::RegularNotificationLevel,
+            text, std::string("Turn off"), turn_off);
+    });
+}
+
+// Human label / unit for a config key, from OrcaSlicer's own definitions.
+static std::string api_config_label(const std::string &key)
+{
+    const ConfigOptionDef *d = print_config_def.get(key);
+    return (d != nullptr && !d->label.empty()) ? d->label : key;
+}
+static std::string api_config_unit(const std::string &key)
+{
+    const ConfigOptionDef *d = print_config_def.get(key);
+    return (d != nullptr && !d->sidetext.empty()) ? (std::string(" ") + d->sidetext) : std::string();
+}
+
 
 void Controller::notify_config_changed(int preset_type)
 {
@@ -219,6 +263,7 @@ Response Controller::handle_put_config(const std::string &body)
 
         nlohmann::json applied = nlohmann::json::array();
         nlohmann::json errors  = nlohmann::json::object();
+        std::vector<std::array<std::string, 3>> changes; // key, old, new -> notification
 
         for (auto it = in.begin(); it != in.end(); ++it) {
             const std::string &key = it.key();
@@ -230,12 +275,14 @@ Response Controller::handle_put_config(const std::string &body)
                 continue;
             }
             try {
+                std::string oldv = tgt->cfg.opt_serialize(key);
                 std::string sval = json_value_to_config_string(it.value());
                 // Orca's own validation: throws BadOptionTypeException /
                 // BadOptionValueException on garbage.
                 tgt->cfg.set_deserialize_strict(key, sval);
                 tgt->touched = true;
                 applied.push_back(key);
+                changes.push_back({ key, oldv, tgt->cfg.opt_serialize(key) });
             } catch (const std::exception &e) {
                 errors[key] = e.what();
             }
@@ -243,8 +290,15 @@ Response Controller::handle_put_config(const std::string &body)
 
         // Atomic: if any key failed validation, apply NOTHING and report errors.
         // (Previously, valid keys in a mixed batch applied before the 422.)
-        if (!errors.empty())
+        if (!errors.empty()) {
+            std::string emsg = "Couldn't update settings";
+            for (auto it2 = errors.begin(); it2 != errors.end(); ++it2) {
+                emsg += "\n\xe2\x80\xa2 ";
+                emsg += api_config_label(it2.key());
+            }
+            api_notify(emsg, true);
             return {{"applied", nlohmann::json::array()}, {"errors", errors}};
+        }
 
         // Apply through the GUI's own path: dirty markers + live panel refresh.
         // Same idiom as PlaterPresetComboBox::change_extruder_color()
@@ -261,6 +315,22 @@ Response Controller::handle_put_config(const std::string &body)
                 tab->load_config(t.cfg);
                 wxGetApp().plater()->on_config_change(t.cfg);
             }
+
+        if (!changes.empty()) {
+            std::string msg = "Settings updated";
+            int shown = 0;
+            for (auto &ch : changes) {
+                if (shown < 6) {
+                    msg += "\n\xe2\x80\xa2 ";
+                    msg += api_config_label(ch[0]);
+                    msg += ": " + ch[1] + " \xe2\x86\x92 " + ch[2] + api_config_unit(ch[0]);
+                }
+                ++shown;
+            }
+            if (shown > 6)
+                msg += "\n(+ " + std::to_string(shown - 6) + " more)";
+            api_notify(msg, false);
+        }
 
         return {{"applied", applied}, {"errors", errors}};
     });
@@ -402,9 +472,11 @@ Response Controller::handle_load_model(const std::string &body)
         size_t n = std::char_traits<char>::length(suf);
         return lower.size() >= n && lower.compare(lower.size() - n, n, suf) == 0;
     };
-    if (!(ends_with(".stl") || ends_with(".obj") || ends_with(".3mf")))
+    if (!(ends_with(".stl") || ends_with(".obj") || ends_with(".3mf"))) {
+        api_notify("Can't load " + boost::filesystem::path(path).filename().string() + ": unsupported format", true);
         return { 422, {{"error", "unsupported_format"},
                        {"detail", "remote load supports .stl, .obj, .3mf (v1)"}} };
+    }
 
     nlohmann::json r = run_on_ui([path]() -> nlohmann::json {
         if (!boost::filesystem::exists(path))
@@ -423,10 +495,13 @@ Response Controller::handle_load_model(const std::string &body)
         }
         return {{"loaded", true}, {"objects", objects}};
     });
+    std::string fn = boost::filesystem::path(path).filename().string();
     if (r.contains("error")) {
+        api_notify("Couldn't load " + fn, true);
         if (r["error"] == "not_found") return { 404, r };
         return { 422, r };
     }
+    api_notify("Added " + fn + " to the plate");
     return { 200, r };
 }
 
@@ -474,9 +549,13 @@ Response Controller::handle_select_preset(const std::string &body)
         return {{"selected", name}};
     });
     if (r.contains("error")) {
-        if (r["error"] == "unknown_preset") return { 422, r };
+        if (r["error"] == "unknown_preset") {
+            api_notify("No such " + type_s + " preset '" + name + "'", true);
+            return { 422, r };
+        }
         return { 500, r };
     }
+    api_notify("Switched to " + type_s + " preset '" + name + "'");
     return { 200, r };
 }
 
@@ -557,8 +636,10 @@ Response Controller::handle_delete_object(uint64_t id)
     nlohmann::json r = run_on_ui([id]() -> nlohmann::json {
         Plater *plater = wxGetApp().plater();
         int idx = find_object_index(plater->model(), id);
-        if (idx < 0) return {{"error", "unknown_object"}};
+        if (idx < 0) { api_notify("Object not found", true); return {{"error", "unknown_object"}}; }
+        std::string oname = plater->model().objects[idx]->name;
         plater->remove((size_t) idx);
+        api_notify("Removed '" + oname + "'");
         return {{"deleted", true}, {"id", id}, {"count", plater->model().objects.size()}};
     });
     if (r.contains("error")) return { 404, r };
@@ -585,7 +666,7 @@ Response Controller::handle_transform_object(uint64_t id, const std::string &bod
     nlohmann::json r = run_on_ui([=]() -> nlohmann::json {
         Plater *plater = wxGetApp().plater();
         int idx = find_object_index(plater->model(), id);
-        if (idx < 0) return {{"error", "unknown_object"}};
+        if (idx < 0) { api_notify("Object not found", true); return {{"error", "unknown_object"}}; }
         ModelObject *mo = plater->model().objects[idx];
         if (mo->instances.empty()) return {{"error", "no_instance"}};
         ModelInstance *mi = mo->instances.front();
@@ -593,6 +674,7 @@ Response Controller::handle_transform_object(uint64_t id, const std::string &bod
         if (has_r) mi->set_rotation(mi->get_rotation() + ro * 0.017453292519943295); // deg->rad
         if (has_s) mi->set_scaling_factor(sc);
         plater->changed_object(idx);
+        api_notify(std::string(has_t ? "Moved" : (has_r ? "Rotated" : "Resized")) + " '" + mo->name + "'");
         auto off = mi->get_offset(); auto rot = mi->get_rotation(); auto scl = mi->get_scaling_factor();
         return {{"id", id}, {"transform", {
             {"offset",   {off.x(), off.y(), off.z()}},
@@ -600,6 +682,26 @@ Response Controller::handle_transform_object(uint64_t id, const std::string &bod
             {"scale",    {scl.x(), scl.y(), scl.z()}}}}};
     });
     if (r.contains("error")) return { 404, r };
+    return { 200, r };
+}
+
+Response Controller::handle_duplicate_object(uint64_t id)
+{
+    nlohmann::json r = run_on_ui([id]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        Model &model = plater->model();
+        int idx = find_object_index(model, id);
+        if (idx < 0) { api_notify("Object not found", true); return {{"error", "unknown_object"}}; }
+        ModelObject *mo = model.objects[idx];
+        if (mo->instances.empty()) return {{"error", "no_instance"}};
+        const ModelInstance *src = mo->instances.front();
+        Vec3d off = src->get_offset() + Vec3d(10.0, 10.0, 0.0);
+        mo->add_instance(off, src->get_scaling_factor(), src->get_rotation(), src->get_mirror());
+        plater->changed_object(idx);
+        api_notify("Duplicated '" + mo->name + "'");
+        return {{"duplicated", true}, {"id", id}, {"instances", (unsigned) mo->instances.size()}};
+    });
+    if (r.contains("error")) return { r["error"] == "unknown_object" ? 404 : 422, r };
     return { 200, r };
 }
 
@@ -699,6 +801,8 @@ Response Controller::dispatch(const Request &req)
                     try { return handle_transform_object(oid, req.body); }
                     catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
                 }
+                if (req.method == "POST" && action == "duplicate")
+                    return handle_duplicate_object(oid);
                 return { 404, {{"error", "not_found"}} };
             }
         }

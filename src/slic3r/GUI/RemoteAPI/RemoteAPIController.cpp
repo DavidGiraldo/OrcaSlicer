@@ -16,6 +16,8 @@
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp" // LoadStrategy (used by Plater::load_files)
+#include "libslic3r/Slicing.hpp"          // M4c: layer_height_profile_adaptive, t_layer_height_range
+#include "slic3r/GUI/GUI_ObjectList.hpp" // M4c: obj_list()->update_info_items
 
 #include <algorithm>
 #include <array>
@@ -50,16 +52,42 @@ static void api_notify(const std::string &text, bool warning = false)
         if (plater == nullptr) return;
         NotificationManager *nm = plater->get_notification_manager();
         if (nm == nullptr) return;
-        // "Turn off" hypertext: one click disables future API notifications.
-        auto turn_off = [](wxEvtHandler *) -> bool {
-            auto *ac2 = wxGetApp().app_config;
-            if (ac2) { ac2->set_bool("remote_api_notify", false); ac2->save(); }
-            return true; // also dismisses this toast
-        };
-        nm->push_notification(NotificationType::CustomNotification,
-            warning ? NotificationManager::NotificationLevel::WarningNotificationLevel
-                    : NotificationManager::NotificationLevel::RegularNotificationLevel,
-            text, std::string("Turn off"), turn_off);
+        // Coalesce rapid-fire API messages into ONE toast: anything arriving within
+        // a 5s quiet window is re-shown together as a list instead of a toast flood.
+        // Plain text, ASCII only (the notification font lacks bullet/arrow glyphs);
+        // notifications are toggled via Preferences (remote_api_notify).
+        static std::vector<std::string> recent;   // GUI thread only
+        static bool       recent_warning = false;
+        static wxLongLong last_ms = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - last_ms).GetValue() > 5000) { recent.clear(); recent_warning = false; }
+        last_ms = now;
+        recent.push_back(text);
+        recent_warning |= warning;
+
+        std::string body;
+        if (recent.size() == 1)
+            body = recent.front();
+        else {
+            body = "Remote changes:";
+            size_t shown = 0;
+            for (const std::string &m : recent) {
+                if (shown < 6) {
+                    std::string item = m;
+                    size_t pos = 0;   // indent detail lines under their list entry
+                    while ((pos = item.find('\n', pos)) != std::string::npos) { item.replace(pos, 1, "\n   "); pos += 4; }
+                    body += "\n - " + item;
+                }
+                ++shown;
+            }
+            if (shown > 6)
+                body += "\n(+ " + std::to_string(shown - 6) + " more)";
+        }
+        nm->close_notification_of_type(NotificationType::RemoteAPIChange);
+        nm->push_notification(NotificationType::RemoteAPIChange,
+            recent_warning ? NotificationManager::NotificationLevel::WarningNotificationLevel
+                           : NotificationManager::NotificationLevel::RegularNotificationLevel,
+            body);
     });
 }
 
@@ -74,6 +102,8 @@ static std::string api_config_unit(const std::string &key)
     const ConfigOptionDef *d = print_config_def.get(key);
     return (d != nullptr && !d->sidetext.empty()) ? (std::string(" ") + d->sidetext) : std::string();
 }
+
+static int find_object_index(const Model &model, uint64_t id); // defined with the M4b object handlers below
 
 
 void Controller::notify_config_changed(int preset_type)
@@ -293,7 +323,7 @@ Response Controller::handle_put_config(const std::string &body)
         if (!errors.empty()) {
             std::string emsg = "Couldn't update settings";
             for (auto it2 = errors.begin(); it2 != errors.end(); ++it2) {
-                emsg += "\n\xe2\x80\xa2 ";
+                emsg += "\n - ";
                 emsg += api_config_label(it2.key());
             }
             api_notify(emsg, true);
@@ -321,9 +351,9 @@ Response Controller::handle_put_config(const std::string &body)
             int shown = 0;
             for (auto &ch : changes) {
                 if (shown < 6) {
-                    msg += "\n\xe2\x80\xa2 ";
+                    msg += "\n - ";
                     msg += api_config_label(ch[0]);
-                    msg += ": " + ch[1] + " \xe2\x86\x92 " + ch[2] + api_config_unit(ch[0]);
+                    msg += ": " + ch[1] + " -> " + ch[2] + api_config_unit(ch[0]);
                 }
                 ++shown;
             }
@@ -559,6 +589,284 @@ Response Controller::handle_select_preset(const std::string &body)
     return { 200, r };
 }
 
+// POST /api/v1/preset/save  body {"type":"print|filament|printer","name":"...","detach":false?}
+// Persists the collection's currently edited settings as a named user preset
+// (create or update) via Tab::save_preset, which with a non-empty name runs the
+// GUI Save flow without any dialog.
+Response Controller::handle_save_preset(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object() || !in.contains("type") || !in.contains("name")
+        || !in["type"].is_string() || !in["name"].is_string())
+        return { 400, {{"error", "missing_fields"}} };
+    std::string type_s = in["type"].get<std::string>();
+    std::string name   = in["name"].get<std::string>();
+    bool detach = in.value("detach", false);
+    Preset::Type type = type_s == "print"    ? Preset::TYPE_PRINT :
+                        type_s == "filament" ? Preset::TYPE_FILAMENT :
+                        type_s == "printer"  ? Preset::TYPE_PRINTER : Preset::TYPE_INVALID;
+    if (type == Preset::TYPE_INVALID)
+        return { 400, {{"error", "unknown_type"}} };
+    // SavePresetDialog normally enforces the name rules; mirror them headless.
+    while (!name.empty() && (name.front() == ' ' || name.back() == ' ')) {
+        if (name.front() == ' ') name.erase(name.begin());
+        else name.pop_back();
+    }
+    static const std::string unusable_symbols = "<>[]:/\\|?*\"";
+    bool bad_char = name.find_first_of(unusable_symbols) != std::string::npos;
+    for (char c : name)
+        if (static_cast<unsigned char>(c) < 0x20) bad_char = true;
+    if (name.empty() || name == "." || name == ".." || name.size() > 128 || bad_char)
+        return { 400, {{"error", "invalid_name"}} };
+
+    nlohmann::json r = run_on_ui([type, name, detach]() -> nlohmann::json {
+        auto *bundle = wxGetApp().preset_bundle;
+        PresetCollection &presets = type == Preset::TYPE_PRINT    ? bundle->prints :
+                                    type == Preset::TYPE_FILAMENT ? bundle->filaments :
+                                                                    bundle->printers;
+        const Preset *existing = presets.find_preset(name, false);
+        if (existing != nullptr && (existing->is_system || existing->is_default))
+            return {{"error", "name_reserved"}};
+        Tab *tab = wxGetApp().get_tab(type);
+        if (tab == nullptr) return {{"error", "tab_unavailable"}};
+        bool created = existing == nullptr;
+        tab->save_preset(name, detach, /*save_to_project=*/false);
+        // save_preset returns void; confirm the preset actually landed.
+        const Preset *saved = presets.find_preset(name, false);
+        if (saved == nullptr) return {{"error", "save_failed"}};
+        return {{"saved", name}, {"created", created}};
+    });
+    if (r.contains("error")) {
+        if (r["error"] == "name_reserved") {
+            api_notify("Can't overwrite built-in " + type_s + " preset '" + name + "'", true);
+            return { 409, r };
+        }
+        return { 500, r };
+    }
+    api_notify((r["created"].get<bool>() ? "Saved new " : "Updated ") + type_s + " preset '" + name + "'");
+    return { 200, r };
+}
+
+// GET /api/v1/presets -> preset names per collection, with system/selected flags.
+Response Controller::handle_get_presets()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        auto *bundle = wxGetApp().preset_bundle;
+        auto dump = [](const PresetCollection &c) {
+            nlohmann::json arr = nlohmann::json::array();
+            const std::string sel = c.get_selected_preset_name();
+            for (const Preset &p : c.get_presets()) {
+                if (p.is_default) continue;
+                arr.push_back({{"name", p.name}, {"system", p.is_system},
+                               {"visible", p.is_visible}, {"selected", p.name == sel}});
+            }
+            return arr;
+        };
+        return {{"print", dump(bundle->prints)},
+                {"filament", dump(bundle->filaments)},
+                {"printer", dump(bundle->printers)}};
+    });
+    return { 200, r };
+}
+
+// PUT /api/v1/objects/{id}/layer_height  body {"mode":"adaptive","quality":0..1} | {"mode":"reset"}
+// Mirrors GLCanvas3D::LayersEditing::adaptive_layer_height_profile / reset_layer_height_profile.
+Response Controller::handle_put_layer_height(uint64_t id, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object() || !in.contains("mode") || !in["mode"].is_string())
+        return { 400, {{"error", "missing_mode"}, {"detail", "adaptive|reset"}} };
+    std::string mode = in["mode"].get<std::string>();
+    if (mode != "adaptive" && mode != "reset")
+        return { 400, {{"error", "unknown_mode"}, {"detail", "adaptive|reset"}} };
+    double quality = in.value("quality", 0.5);
+    if (!(quality >= 0.0 && quality <= 1.0))
+        return { 400, {{"error", "quality_out_of_range"}, {"detail", "0..1"}} };
+
+    nlohmann::json r = run_on_ui([id, mode, quality]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        int idx = find_object_index(plater->model(), id);
+        if (idx < 0) return {{"error", "unknown_object"}};
+        ModelObject *mo = plater->model().objects[idx];
+        if (mode == "reset") {
+            mo->layer_height_profile.clear();
+            plater->schedule_background_process();
+            wxGetApp().obj_list()->update_info_items(idx);
+            api_notify("Reset layer height profile on '" + mo->name + "'");
+            return {{"id", id}, {"mode", "reset"}};
+        }
+        const DynamicPrintConfig full_cfg = wxGetApp().preset_bundle->full_config();
+        // object_max_z 0 -> computed from the object's raw bounding box inside.
+        SlicingParameters sp = PrintObject::slicing_parameters(
+            full_cfg, *mo, 0.f, plater->fff_print().shrinkage_compensation());
+        std::vector<double> profile = layer_height_profile_adaptive(sp, *mo, (float) quality);
+        if (profile.size() < 4)
+            return {{"error", "profile_failed"}};
+        mo->layer_height_profile.set(std::move(profile));
+        const std::vector<double> &prof = mo->layer_height_profile.get();
+        plater->schedule_background_process();
+        wxGetApp().obj_list()->update_info_items(idx);
+        double hmin = prof[1], hmax = prof[1];
+        for (size_t i = 1; i < prof.size(); i += 2) {
+            hmin = std::min(hmin, prof[i]);
+            hmax = std::max(hmax, prof[i]);
+        }
+        api_notify("Applied adaptive layer height to '" + mo->name + "'");
+        return {{"id", id}, {"mode", "adaptive"}, {"quality", quality},
+                {"points", (unsigned) (prof.size() / 2)},
+                {"layer_height_min", hmin}, {"layer_height_max", hmax}};
+    });
+    if (r.contains("error"))
+        return { r["error"] == "unknown_object" ? 404 : 422, r };
+    return { 200, r };
+}
+
+// PUT /api/v1/objects/{id}/height_range
+//   body {"min_z":a,"max_z":b,"layer_height":h}  (exact same range = update)
+//      | {"clear":true}                          (remove all ranges)
+Response Controller::handle_put_height_range(uint64_t id, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object())
+        return { 400, {{"error", "body_must_be_object"}} };
+    bool clear = in.value("clear", false);
+    double min_z = in.value("min_z", -1.0);
+    double max_z = in.value("max_z", -1.0);
+    double lh    = in.value("layer_height", 0.0);
+    if (!clear) {
+        if (!in.contains("min_z") || !in.contains("max_z") || !in.contains("layer_height"))
+            return { 400, {{"error", "missing_fields"}, {"detail", "min_z, max_z, layer_height (or clear:true)"}} };
+        if (!(min_z >= 0.0) || !(max_z > min_z))
+            return { 400, {{"error", "bad_range"}, {"detail", "need 0 <= min_z < max_z"}} };
+    }
+
+    nlohmann::json r = run_on_ui([id, clear, min_z, max_z, lh]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        int idx = find_object_index(plater->model(), id);
+        if (idx < 0) return {{"error", "unknown_object"}};
+        ModelObject *mo = plater->model().objects[idx];
+        auto ranges_json = [mo]() {
+            nlohmann::json a = nlohmann::json::array();
+            for (const auto &kv : mo->layer_config_ranges)
+                a.push_back({{"min_z", kv.first.first}, {"max_z", kv.first.second},
+                             {"layer_height", kv.second.has("layer_height") ? kv.second.opt_float("layer_height") : 0.0}});
+            return a;
+        };
+        if (clear) {
+            mo->layer_config_ranges.clear();
+            plater->changed_object(idx);
+            wxGetApp().obj_list()->update_info_items(idx);
+            api_notify("Cleared height ranges on '" + mo->name + "'");
+            return {{"id", id}, {"height_ranges", ranges_json()}};
+        }
+        // Printer limits, same rules as ObjectList's get_min/max_layer_height.
+        const DynamicPrintConfig &pcfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+        double minh = pcfg.opt_float("min_layer_height", 0);
+        double maxh = pcfg.opt_float("max_layer_height", 0);
+        if (maxh < EPSILON) maxh = 0.75 * pcfg.opt_float("nozzle_diameter", 0);
+        if (lh < minh || lh > maxh)
+            return {{"error", "layer_height_out_of_range"}, {"min", minh}, {"max", maxh}};
+        t_layer_height_range key{ min_z, max_z };
+        for (const auto &kv : mo->layer_config_ranges) {
+            if (kv.first == key) continue;
+            if (min_z < kv.first.second && kv.first.first < max_z)
+                return {{"error", "overlaps_existing"},
+                        {"existing", {kv.first.first, kv.first.second}}};
+        }
+        DynamicPrintConfig c;
+        c.set_key_value("layer_height", new ConfigOptionFloat(lh));
+        c.set_key_value("extruder",     new ConfigOptionInt(0));
+        mo->layer_config_ranges[key].assign_config(std::move(c));
+        plater->changed_object(idx);
+        wxGetApp().obj_list()->update_info_items(idx);
+        api_notify("Set height range " + std::to_string(min_z) + "-" + std::to_string(max_z) + " mm on '" + mo->name + "'");
+        return {{"id", id}, {"height_ranges", ranges_json()}};
+    });
+    if (r.contains("error"))
+        return { r["error"] == "unknown_object" ? 404 : 422, r };
+    return { 200, r };
+}
+
+// Shared: parse {"type","name"} and resolve the collection. Returns nullptr collection on bad type.
+static PresetCollection *api_preset_collection(const std::string &type_s)
+{
+    auto *bundle = wxGetApp().preset_bundle;
+    return type_s == "print"    ? &bundle->prints :
+           type_s == "filament" ? &bundle->filaments :
+           type_s == "printer"  ? &bundle->printers : nullptr;
+}
+
+// POST /api/v1/preset/config  body {"type","name"} -> full config of that named preset.
+// POST (not GET) so names with spaces/@ need no URL encoding; read-only.
+Response Controller::handle_get_preset_config(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object() || !in.contains("type") || !in.contains("name")
+        || !in["type"].is_string() || !in["name"].is_string())
+        return { 400, {{"error", "missing_fields"}} };
+    std::string type_s = in["type"].get<std::string>();
+    std::string name   = in["name"].get<std::string>();
+    nlohmann::json r = run_on_ui([type_s, name]() -> nlohmann::json {
+        PresetCollection *presets = api_preset_collection(type_s);
+        if (presets == nullptr) return {{"error", "unknown_type"}};
+        const Preset *p = presets->find_preset(name, false);
+        if (p == nullptr) return {{"error", "unknown_preset"}};
+        nlohmann::json cfg = nlohmann::json::object();
+        for (const std::string &k : p->config.keys()) cfg[k] = p->config.opt_serialize(k);
+        return {{"name", p->name}, {"system", p->is_system}, {"config", cfg}};
+    });
+    if (r.contains("error")) {
+        if (r["error"] == "unknown_type") return { 400, r };
+        return { 404, r };
+    }
+    return { 200, r };
+}
+
+// DELETE /api/v1/preset  body {"type","name"} -> remove a USER preset (file + list entry).
+// Guards: never system/default, never the selected preset (select another first),
+// never a base preset that other presets inherit from (same rule as the GUI).
+Response Controller::handle_delete_preset(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object() || !in.contains("type") || !in.contains("name")
+        || !in["type"].is_string() || !in["name"].is_string())
+        return { 400, {{"error", "missing_fields"}} };
+    std::string type_s = in["type"].get<std::string>();
+    std::string name   = in["name"].get<std::string>();
+    Preset::Type type = type_s == "print"    ? Preset::TYPE_PRINT :
+                        type_s == "filament" ? Preset::TYPE_FILAMENT :
+                        type_s == "printer"  ? Preset::TYPE_PRINTER : Preset::TYPE_INVALID;
+    if (type == Preset::TYPE_INVALID)
+        return { 400, {{"error", "unknown_type"}} };
+    nlohmann::json r = run_on_ui([type, type_s, name]() -> nlohmann::json {
+        PresetCollection *presets = api_preset_collection(type_s);
+        const Preset *p = presets->find_preset(name, false);
+        if (p == nullptr) return {{"error", "unknown_preset"}};
+        if (p->is_system || p->is_default) return {{"error", "builtin_preset"}};
+        if (presets->get_selected_preset_name() == name)
+            return {{"error", "preset_selected"},
+                    {"detail", "select another preset first, then delete"}};
+        for (const Preset &other : presets->get_presets())
+            if (other.name != name && other.inherits() == name)
+                return {{"error", "has_children"},
+                        {"detail", "other presets inherit from this one"}};
+        if (!presets->delete_preset(name))
+            return {{"error", "delete_failed"}};
+        // Refresh the tab's preset list + the plater sidebar combo.
+        if (Tab *tab = wxGetApp().get_tab(type); tab != nullptr)
+            tab->update_tab_ui();
+        wxGetApp().plater()->sidebar().update_presets(type);
+        api_notify("Deleted " + type_s + " preset '" + name + "'");
+        return {{"deleted", name}};
+    });
+    if (r.contains("error")) {
+        if (r["error"] == "unknown_preset") return { 404, r };
+        if (r["error"] == "delete_failed")  return { 500, r };
+        return { 409, r };
+    }
+    return { 200, r };
+}
+
 // M4a: GET /api/v1/gcode  -> raw G-code of the current plate's last successful slice
 Response Controller::handle_get_gcode()
 {
@@ -614,6 +922,19 @@ Response Controller::handle_get_objects()
                     {"rotation", {rot.x(), rot.y(), rot.z()}},
                     {"scale",    {scl.x(), scl.y(), scl.z()}},
                 };
+            }
+            // M4c readback: per-object overrides + variable-layer-height state
+            {
+                const DynamicPrintConfig ocfg = mo->config.get();
+                nlohmann::json cfgj = nlohmann::json::object();
+                for (const std::string &k : ocfg.keys()) cfgj[k] = ocfg.opt_serialize(k);
+                o["config"] = cfgj;
+                o["custom_layer_profile"] = !mo->layer_height_profile.empty();
+                nlohmann::json rngs = nlohmann::json::array();
+                for (const auto &kv : mo->layer_config_ranges)
+                    rngs.push_back({{"min_z", kv.first.first}, {"max_z", kv.first.second},
+                                    {"layer_height", kv.second.has("layer_height") ? kv.second.opt_float("layer_height") : 0.0}});
+                o["height_ranges"] = rngs;
             }
             objects.push_back(std::move(o));
         }
@@ -813,8 +1134,30 @@ Response Controller::dispatch(const Request &req)
                 return { 400, {{"error", "invalid_json"}} };
             }
         }
+        if (is("POST", "/api/v1/preset/save")) {
+            try {
+                return handle_save_preset(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
+        if (is("POST", "/api/v1/preset/config")) {
+            try {
+                return handle_get_preset_config(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
+        if (is("DELETE", "/api/v1/preset")) {
+            try {
+                return handle_delete_preset(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
         if (is("GET",  "/api/v1/gcode"))        return handle_get_gcode();
         if (is("GET",  "/api/v1/objects"))      return handle_get_objects();
+        if (is("GET",  "/api/v1/presets"))      return handle_get_presets();
         if (is("POST", "/api/v1/arrange"))      return handle_arrange();
         if (is("POST", "/api/v1/orient"))       return handle_orient();
         if (is("GET",  "/api/v1/jobs/status"))  return handle_jobs_status();
@@ -840,6 +1183,14 @@ Response Controller::dispatch(const Request &req)
                     return handle_duplicate_object(oid);
                 if (req.method == "PUT" && action == "config") {
                     try { return handle_put_object_config(oid, req.body); }
+                    catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+                }
+                if (req.method == "PUT" && action == "layer_height") {
+                    try { return handle_put_layer_height(oid, req.body); }
+                    catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+                }
+                if (req.method == "PUT" && action == "height_range") {
+                    try { return handle_put_height_range(oid, req.body); }
                     catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
                 }
                 return { 404, {{"error", "not_found"}} };

@@ -2340,6 +2340,14 @@ void PreferencesDialog::create_remote_api_page(wxBoxSizer* sizer_page, int v_gap
         "remote_api_bind_lan");
     g_sizer->Add(item_lan);
 
+    auto item_notify = create_item_checkbox(
+        _L("Notify on API changes"),
+        _L("Show a notification in OrcaSlicer when an external tool changes settings, "
+           "loads or edits objects, or switches presets. Slicing and arrange/orient use "
+           "OrcaSlicer's own feedback."),
+        "remote_api_notify");
+    g_sizer->Add(item_notify);
+
     // Port row (bespoke). The stock create_item_input() unconditionally writes the
     // field's raw text back to AppConfig on every Enter/focus-loss (see the
     // handlers in create_item_input) with no empty/range guard, and shows a blank

@@ -47,6 +47,8 @@
 #include <ctime>
 #include <boost/filesystem/operations.hpp>
 #include "slic3r/GUI/calib_dlg.hpp"
+#include "RemoteAPI/RemoteAPIController.hpp" // F8: backup/API mutual exclusion
+
 #include <wx/panel.h>
 #include <wx/settings.h>
 #include <wx/textentry.h>
@@ -237,7 +239,7 @@ private:
     void OnPaint(wxPaintEvent&)
     {
         wxPaintDC dc(this);
-        // Transparent — draw nothing
+        // Transparent - draw nothing
     }
 
     GdkWindowEdge get_gdk_edge(const wxPoint& pos) const
@@ -766,9 +768,25 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
                 wxPostEvent(this, wxCommandEvent(EVT_BACKUP_POST));
             }
             else if (action == 1) {
+                // Remote API (F8): never export while an API mutation is on the
+                // stack (this callback can run from a nested event pump inside
+                // it) - skip and re-arm for the next cycle instead.
+                if (Slic3r::GUI::RemoteAPI::Controller::api_ui_task_active()) {
+                    Slic3r::backup_soon();
+                    return;
+                }
                 if (!m_plater->up_to_date(false, true)) {
-                    m_plater->export_3mf(m_plater->model().get_backup_path() + "/.3mf", SaveStrategy::Backup);
-                    m_plater->up_to_date(true, true);
+                    // Bracket the export so API mutations arriving mid-export
+                    // (via its event pumping) are parked, not interleaved (F8).
+                    Slic3r::GUI::RemoteAPI::Controller::set_backup_in_progress(true);
+                    try {
+                        m_plater->export_3mf(m_plater->model().get_backup_path() + "/.3mf", SaveStrategy::Backup);
+                        m_plater->up_to_date(true, true);
+                    } catch (...) {
+                        Slic3r::GUI::RemoteAPI::Controller::set_backup_in_progress(false);
+                        throw;
+                    }
+                    Slic3r::GUI::RemoteAPI::Controller::set_backup_in_progress(false);
                 }
             }
          });
@@ -1272,7 +1290,7 @@ void MainFrame::shutdown()
         design->shutdown();
 #endif
 #ifdef __WXGTK__
-    // Edge panels are child windows — wxWidgets destroys them automatically.
+    // Edge panels are child windows - wxWidgets destroys them automatically.
     m_edge_bottom = nullptr;
     m_edge_left   = nullptr;
     m_edge_right  = nullptr;

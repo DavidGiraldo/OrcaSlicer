@@ -35,6 +35,14 @@ public:
     static void notify_config_changed(int preset_type);
     static void notify_project_opened();
 
+    // F8 mutual-exclusion gates between API UI mutations and the periodic
+    // auto-backup 3MF exporter (which pumps the event queue mid-export, so the
+    // two can interleave on the GUI thread and corrupt what is being written).
+    // GUI thread only.
+    static bool api_ui_task_active();          // an API task is on the stack
+    static void set_backup_in_progress(bool);  // MainFrame brackets export_3mf;
+                                               // false flushes deferred API tasks
+
     SliceState slice_state() const { std::lock_guard<std::mutex> lk(m_mutex); return m_slice; }
 
     // Call once on the GUI thread after the plater exists (from start_remote_api()).
@@ -47,6 +55,7 @@ private:
     Response handle_put_config(const std::string &body);
     Response handle_slice();
     Response handle_slice_status();
+    Response handle_slice_cancel();   // F2: POST /slice/cancel - unwedge/abort
     Response handle_load_model(const std::string &body);   // M4a: POST /model
     Response handle_select_preset(const std::string &body); // M4a: PUT /preset
     Response handle_save_preset(const std::string &body);   // POST /preset/save

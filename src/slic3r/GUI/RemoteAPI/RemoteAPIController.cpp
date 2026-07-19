@@ -24,8 +24,10 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <deque>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <sstream>
 #include <vector>
 
@@ -148,24 +150,81 @@ void Controller::on_config_changed(int preset_type)
     });
 }
 
+// --- F8 gates (GUI thread only) ----------------------------------------------
+// The periodic auto-backup exporter (MainFrame, every 10s) pumps the event
+// queue while it serializes the project, so a queued CallAfter API mutation
+// could execute INSIDE export_3mf and mutate the model/presets being written -
+// observed as heap-corruption crashes under config-write and preset-save
+// bursts. Two-way exclusion: API tasks arriving during an export are parked on
+// s_deferred_ui_tasks and flushed when the export ends; the exporter skips a
+// cycle (re-arming itself) if an API task is on the stack (nested-pump case).
+namespace {
+
+struct UiTask : std::enable_shared_from_this<UiTask>
+{
+    std::shared_ptr<std::promise<nlohmann::json>> promise;
+    std::shared_ptr<std::atomic<bool>>            cancelled;
+    std::function<nlohmann::json()>               fn;
+
+    void schedule()
+    {
+        auto self = shared_from_this();
+        wxGetApp().CallAfter([self] { self->run(); });
+    }
+    void run(); // defined after the gate statics below
+};
+
+int  s_api_ui_task_depth  = 0;
+bool s_backup_in_progress = false;
+std::deque<std::shared_ptr<UiTask>> s_deferred_ui_tasks;
+
+void UiTask::run()
+{
+    if (cancelled->load()) return; // caller already returned 504; do nothing
+    if (s_backup_in_progress) {    // parked until set_backup_in_progress(false)
+        s_deferred_ui_tasks.push_back(shared_from_this());
+        return;
+    }
+    ++s_api_ui_task_depth;
+    // Push the next periodic backup out of the mutation window so it doesn't
+    // fire between the calls of an API burst.
+    Slic3r::backup_defer(3);
+    try {
+        promise->set_value(fn());
+    } catch (...) {
+        promise->set_exception(std::current_exception());
+    }
+    --s_api_ui_task_depth;
+}
+
+} // namespace
+
+bool Controller::api_ui_task_active() { return s_api_ui_task_depth > 0; }
+
+void Controller::set_backup_in_progress(bool v)
+{
+    s_backup_in_progress = v;
+    if (!v && !s_deferred_ui_tasks.empty()) {
+        auto parked = std::move(s_deferred_ui_tasks);
+        s_deferred_ui_tasks.clear();
+        for (auto &t : parked)
+            t->schedule(); // re-queued, not run inline: let the export unwind first
+    }
+}
+
 nlohmann::json Controller::run_on_ui(std::function<nlohmann::json()> fn)
 {
-    auto promise   = std::make_shared<std::promise<nlohmann::json>>();
-    auto future    = promise->get_future();
+    auto task       = std::make_shared<UiTask>();
+    task->promise   = std::make_shared<std::promise<nlohmann::json>>();
     // Set if the io side gives up (10s timeout) before the GUI lambda runs. The
     // lambda checks it at the top, so a timed-out request does NOT still apply
     // its side effects (PUT config / reslice) on the GUI thread afterwards.
-    auto cancelled = std::make_shared<std::atomic<bool>>(false);
-    wxGetApp().CallAfter([promise, cancelled, fn = std::move(fn)] {
-        if (cancelled->load()) return; // caller already returned 504; do nothing
-        try {
-            promise->set_value(fn());
-        } catch (...) {
-            promise->set_exception(std::current_exception());
-        }
-    });
+    task->cancelled = std::make_shared<std::atomic<bool>>(false);
+    task->fn        = std::move(fn);
+    auto future     = task->promise->get_future();
+    task->schedule();
     if (future.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-        cancelled->store(true);
+        task->cancelled->store(true);
         throw std::runtime_error("ui_timeout");
     }
     return future.get(); // rethrows GUI-side exceptions
@@ -226,7 +285,7 @@ Response Controller::handle_status()
 }
 
 // Percent-decode a query value. Clients (e.g. httpx) percent-encode ',' as %2C, so the
-// keys list must be decoded BEFORE splitting on ',' — otherwise the whole list is one
+// keys list must be decoded BEFORE splitting on ',' - otherwise the whole list is one
 // unmatched key and the filter returns nothing.
 static std::string url_decode(const std::string &s)
 {
@@ -322,7 +381,13 @@ Response Controller::handle_put_config(const std::string &body)
             for (auto &t : targets)
                 if (t.cfg.option(key) != nullptr) { tgt = &t; break; }
             if (tgt == nullptr) {
-                errors[key] = "unknown_key";
+                // F9: distinguish a real typo from a recognized Orca setting that
+                // simply isn't editable through the preset configs (project/plate/
+                // computed-layer keys: wipe tower position, flush volumes, AMS maps...
+                // - GET /config serializes the merged config, which is wider).
+                errors[key] = (print_config_def.get(key) != nullptr)
+                                  ? "not_editable_in_current_config"
+                                  : "unknown_key";
                 continue;
             }
             try {
@@ -444,7 +509,7 @@ void Controller::bind_plater_events()
             }, "slice.cancelled");
             return;
         }
-        // Success: harvest stats on the GUI thread (we ARE on it — wx handler).
+        // Success: harvest stats on the GUI thread (we ARE on it - wx handler).
         nlohmann::json stats, warnings = nlohmann::json::array();
         auto &plates = wxGetApp().plater()->get_partplate_list();
         const PrintStatistics &ps = plates.get_current_fff_print().print_statistics();
@@ -461,7 +526,7 @@ void Controller::bind_plater_events()
                 warnings.push_back({{"level", w.level}, {"message", w.msg}, {"code", w.error_code}});
             // The "toolpath goes beyond the plate boundaries" warning is a GUI plater
             // notification (GLCanvas3D), computed from the gcode viewer's bed-containment
-            // check — so it never reaches res->warnings and was invisible to the API.
+            // check - so it never reaches res->warnings and was invisible to the API.
             // Recompute it here from the same data the viewer uses (BuildVolume::
             // all_paths_inside over the extrude moves) and surface it in warnings[].
             BoundingBoxf3 paths_bbox;
@@ -504,6 +569,20 @@ Response Controller::handle_slice()
             s.stats = nullptr; s.warnings = nlohmann::json::array();
         }, "slice.started");
         plater->reslice();
+        // F2: reslice() bails out synchronously - with NO completion event -
+        // when the plate can't be sliced (update_background_process() INVALID,
+        // e.g. an object fully outside the bed; or a prior hard error pinned on
+        // the plate). m_is_slicing is only set on the started paths, so if it
+        // is false here nothing is coming and the state would wedge at
+        // "slicing" forever. Flip it to error instead.
+        if (!plater->is_background_process_slicing()) {
+            set_slice_state([](SliceState &s) {
+                s.state = "error"; s.percent = -1;
+                s.message = "plate cannot be sliced (object outside bed or invalid state)";
+                s.stats = nullptr; s.warnings = nlohmann::json::array();
+            }, "slice.error");
+            return {{"error", "slice_not_started"}};
+        }
         return {{"started", true}};
     });
     if (r.contains("error")) {
@@ -521,6 +600,27 @@ Response Controller::handle_slice_status()
     if (!s.stats.is_null()) j["stats"] = s.stats;
     j["warnings"] = s.warnings;
     return { 200, j };
+}
+
+// F2: POST /api/v1/slice/cancel - abort a running slice, or unwedge a stale
+// "slicing" state (previously the only recovery was killing the app). Stops the
+// background process if it is actually running, then resets the API state; the
+// EVT_PROCESS_COMPLETED(cancelled) handler, if it fires too, sets the same
+// idle/cancelled state again (idempotent).
+Response Controller::handle_slice_cancel()
+{
+    nlohmann::json r = run_on_ui([this]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        bool was_slicing = slice_state().state == "slicing";
+        if (plater != nullptr)
+            plater->stop_background_slicing();
+        set_slice_state([](SliceState &s) {
+            s.state = "idle"; s.percent = -1; s.message = "cancelled";
+            s.stats = nullptr; s.warnings = nlohmann::json::array();
+        }, "slice.cancelled");
+        return {{"cancelled", was_slicing}};
+    });
+    return { 200, r };
 }
 
 // M4a: POST /api/v1/model  body {"path":"<orca-host path>"}
@@ -1159,6 +1259,7 @@ Response Controller::dispatch(const Request &req)
         }
         if (is("POST", "/api/v1/slice"))        return handle_slice();
         if (is("GET",  "/api/v1/slice/status")) return handle_slice_status();
+        if (is("POST", "/api/v1/slice/cancel")) return handle_slice_cancel();
         if (is("POST", "/api/v1/model")) {
             try {
                 return handle_load_model(req.body);

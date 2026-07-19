@@ -15,6 +15,7 @@
 #include "slic3r/GUI/BackgroundSlicingProcess.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/BuildVolume.hpp"    // all_paths_inside: expose the plate-boundary warning
 #include "libslic3r/Format/bbs_3mf.hpp" // LoadStrategy (used by Plater::load_files)
 #include "libslic3r/Slicing.hpp"          // M4c: layer_height_profile_adaptive, t_layer_height_range
 #include "slic3r/GUI/GUI_ObjectList.hpp" // M4c: obj_list()->update_info_items
@@ -224,13 +225,33 @@ Response Controller::handle_status()
     return { 200, j };
 }
 
+// Percent-decode a query value. Clients (e.g. httpx) percent-encode ',' as %2C, so the
+// keys list must be decoded BEFORE splitting on ',' — otherwise the whole list is one
+// unmatched key and the filter returns nothing.
+static std::string url_decode(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    auto hexval = [](char c) { return c <= '9' ? c - '0' : (std::tolower((unsigned char)c) - 'a' + 10); };
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() &&
+            std::isxdigit((unsigned char)s[i + 1]) && std::isxdigit((unsigned char)s[i + 2])) {
+            out += char(hexval(s[i + 1]) * 16 + hexval(s[i + 2]));
+            i += 2;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
 Response Controller::handle_get_config(const std::string &target)
 {
     // Optional filter: /api/v1/config?keys=layer_height,wall_loops
     std::vector<std::string> keys;
     auto qpos = target.find("?keys=");
     if (qpos != std::string::npos) {
-        std::string list = target.substr(qpos + 6);
+        std::string list = url_decode(target.substr(qpos + 6));
         size_t start = 0;
         while (start <= list.size()) {
             auto comma = list.find(',', start);
@@ -438,6 +459,24 @@ void Controller::bind_plater_events()
                 stats["estimated_time_seconds"] = res->print_statistics.modes.front().time;
             for (const auto &w : res->warnings)
                 warnings.push_back({{"level", w.level}, {"message", w.msg}, {"code", w.error_code}});
+            // The "toolpath goes beyond the plate boundaries" warning is a GUI plater
+            // notification (GLCanvas3D), computed from the gcode viewer's bed-containment
+            // check — so it never reaches res->warnings and was invisible to the API.
+            // Recompute it here from the same data the viewer uses (BuildVolume::
+            // all_paths_inside over the extrude moves) and surface it in warnings[].
+            BoundingBoxf3 paths_bbox;
+            bool any_path = false;
+            for (const auto &mv : res->moves) {
+                if (mv.type == EMoveType::Extrude && mv.extrusion_role != erCustom &&
+                    mv.width != 0.f && mv.height != 0.f) {
+                    paths_bbox.merge(mv.position.cast<double>());
+                    any_path = true;
+                }
+            }
+            if (any_path && !wxGetApp().plater()->build_volume().all_paths_inside(*res, paths_bbox))
+                warnings.push_back({{"level", 3},
+                                    {"message", "A G-code path goes beyond the plate boundaries."},
+                                    {"code", "TOOLPATH_OUTSIDE"}});
         }
         set_slice_state([&](SliceState &s) {
             s.state = "done"; s.percent = 100; s.message = "";

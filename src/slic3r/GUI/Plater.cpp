@@ -227,7 +227,7 @@ static string get_diameter_string(float diameter)
     std::string s = stream.str();
     if (s.find('.') != std::string::npos) {   // Remove trailing zeros, but keep at least one decimal if needed
         s.erase(s.find_last_not_of('0') + 1);
-        if (s.back() == '.') s += '0';        // Ensure "1." → "1.0"
+        if (s.back() == '.') s += '0';        // Ensure "1." -> "1.0"
     }
     return s;
 }
@@ -3218,7 +3218,7 @@ void Sidebar::on_bed_type_change(BedType bed_type)
  *       ↓
  *   MachineObject::parse_json() (updates device state)
  *       ├── vt_slot (std::vector<DevAmsTray>) - virtual tray data for external filament
- *       └── DevFilaSystem → DevAms → DevAmsTray - AMS unit hierarchy
+ *       └── DevFilaSystem -> DevAms -> DevAmsTray - AMS unit hierarchy
  *       ↓
  *   build_filament_ams_list() [THIS FUNCTION] - aggregates into DynamicPrintConfig maps
  *
@@ -17690,6 +17690,14 @@ void Plater::set_bed_position(Vec2d& pos)
 bool Plater::is_background_process_slicing() const
 {
     return p->m_is_slicing;
+}
+
+// Remote API (F2): abort the background slice from the API's cancel route.
+void Plater::stop_background_slicing()
+{
+    if (p->background_process.running())
+        p->background_process.stop();
+    p->m_is_slicing = false;
 }
 
 //BBS: update slicing context

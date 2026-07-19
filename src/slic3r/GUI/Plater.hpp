@@ -515,6 +515,9 @@ public:
     bool has_toolpaths_to_export() const;
     void export_toolpaths_to_obj() const;
     void reslice();
+    // Remote API (F2): stop a running background slice (no-op when idle) and
+    // clear the is-slicing flag. Public sibling of the private stop() calls.
+    void stop_background_slicing();
     void record_slice_preset(std::string action);
     void reslice_SLA_supports(const ModelObject &object, bool postpone_error_messages = false);
     void reslice_SLA_hollowing(const ModelObject &object, bool postpone_error_messages = false);

@@ -264,7 +264,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -542,6 +542,82 @@ void Controller::bind_plater_events()
                 warnings.push_back({{"level", 3},
                                     {"message", "A G-code path goes beyond the plate boundaries."},
                                     {"code", "TOOLPATH_OUTSIDE"}});
+
+            // F14: per-feature (extrusion-role) breakdown for the slice-analytics MCP.
+            // PrintEstimatedStatistics has no per-role TIME, so sum it per role from the
+            // moves (Normal mode, index 0 - matches estimated_time_seconds). Filament comes
+            // from used_filaments_per_role; flow is the COMMANDED volumetric rate
+            // (feedrate * mm3_per_mm), the right basis for detecting flow-ceiling clamping.
+            // Role keys are STABLE Orca config-feature tokens (NOT localized role_to_string)
+            // so the MCP predicted_flows keys match by string - see the fork-breakdown plan.
+            auto role_token = [](int r) -> const char* {
+                switch (r) {
+                    case erExternalPerimeter:        return "outer_wall";
+                    case erPerimeter:                return "inner_wall";
+                    case erInternalInfill:           return "sparse_infill";
+                    case erSolidInfill:              return "internal_solid_infill";
+                    case erTopSolidInfill:           return "top_surface";
+                    case erGapFill:                  return "gap_infill";
+                    case erBridgeInfill:             return "bridge";
+                    case erOverhangPerimeter:        return "overhang_perimeter";
+                    case erBottomSurface:            return "bottom_surface";
+                    case erIroning:                  return "ironing";
+                    case erInternalBridgeInfill:     return "internal_bridge";
+                    case erSkirt:                    return "skirt";
+                    case erBrim:                     return "brim";
+                    case erSupportMaterial:          return "support";
+                    case erSupportMaterialInterface: return "support_interface";
+                    case erSupportTransition:        return "support_transition";
+                    case erWipeTower:                return "wipe_tower";
+                    case erCustom:                   return "custom";
+                    case erMixed:                    return "mixed";
+                    default:                         return nullptr; // erNone / erCount
+                }
+            };
+            struct RoleAgg { double time_s = 0.0, max_flow = 0.0, sum_ft = 0.0; };
+            RoleAgg agg[erCount];
+            for (const auto &mv : res->moves) {
+                if (mv.type != EMoveType::Extrude) continue;
+                int r = (int) mv.extrusion_role;
+                if (r <= 0 || r >= erCount) continue;
+                double t = mv.time[0];
+                double vr = mv.volumetric_rate(); // feedrate * mm3_per_mm
+                agg[r].time_s += t;
+                agg[r].sum_ft += vr * t;
+                if (vr > agg[r].max_flow) agg[r].max_flow = vr;
+            }
+            double total_time = res->print_statistics.modes.empty() ? 0.0
+                                : (double) res->print_statistics.modes.front().time;
+            const auto &fpr = res->print_statistics.used_filaments_per_role;
+            nlohmann::json roles = nlohmann::json::array();
+            for (int r = 1; r < erCount; ++r) {
+                const char *tok = role_token(r);
+                if (tok == nullptr) continue;
+                auto it = fpr.find((ExtrusionRole) r);
+                bool has_fil = (it != fpr.end());
+                if (agg[r].time_s <= 0.0 && !has_fil) continue;
+                nlohmann::json role_j = {
+                    {"role", tok},
+                    {"time_s", agg[r].time_s},
+                    {"time_pct", total_time > 0.0 ? 100.0 * agg[r].time_s / total_time : 0.0},
+                    {"flow_mm3_s", {{"max", agg[r].max_flow},
+                                    {"mean", agg[r].time_s > 0.0 ? agg[r].sum_ft / agg[r].time_s : 0.0}}}
+                };
+                if (has_fil) {
+                    // used_filaments_per_role.first is METERS (GUI convention); emit mm to
+                    // match top-level filament_used_mm. .second is grams.
+                    role_j["filament_mm"] = it->second.first * 1000.0;
+                    role_j["filament_g"]  = it->second.second;
+                }
+                roles.push_back(role_j);
+            }
+            stats["breakdown"] = {
+                {"mode", "normal"},
+                {"total_time_s", total_time},
+                {"roles", roles},
+                {"metrics", nlohmann::json::object()},
+                {"layers", nlohmann::json::array()}
+            };
         }
         set_slice_state([&](SliceState &s) {
             s.state = "done"; s.percent = 100; s.message = "";
@@ -597,7 +673,13 @@ Response Controller::handle_slice_status()
 {
     SliceState s = slice_state();
     nlohmann::json j = {{"state", s.state}, {"percent", s.percent}, {"message", s.message}};
-    if (!s.stats.is_null()) j["stats"] = s.stats;
+    if (!s.stats.is_null()) {
+        j["stats"] = s.stats;
+        // F14: surface the per-role breakdown at TOP LEVEL - the slice-analytics MCP
+        // reads status.breakdown (build_breakdown / prediction_check), not stats.breakdown.
+        if (s.stats.is_object() && s.stats.contains("breakdown"))
+            j["breakdown"] = s.stats["breakdown"];
+    }
     j["warnings"] = s.warnings;
     return { 200, j };
 }

@@ -80,9 +80,10 @@ private:
     // Debounced config.changed emitter (GUI thread; mutex guards the pending set).
     void on_config_changed(int preset_type);
 
-    // Runs fn on the GUI thread, blocks the calling (io) thread up to 10 s.
-    // Throws std::runtime_error("ui_timeout") on expiry.
-    nlohmann::json run_on_ui(std::function<nlohmann::json()> fn);
+    // Runs fn on the GUI thread, blocks the calling (io) thread up to
+    // timeout_s seconds (default 10). Throws std::runtime_error("ui_timeout")
+    // on expiry.
+    nlohmann::json run_on_ui(std::function<nlohmann::json()> fn, int timeout_s = 10);
 
     mutable std::mutex m_mutex;
     SliceState         m_slice;

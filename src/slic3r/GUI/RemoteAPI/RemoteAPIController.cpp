@@ -212,7 +212,7 @@ void Controller::set_backup_in_progress(bool v)
     }
 }
 
-nlohmann::json Controller::run_on_ui(std::function<nlohmann::json()> fn)
+nlohmann::json Controller::run_on_ui(std::function<nlohmann::json()> fn, int timeout_s)
 {
     auto task       = std::make_shared<UiTask>();
     task->promise   = std::make_shared<std::promise<nlohmann::json>>();
@@ -223,7 +223,7 @@ nlohmann::json Controller::run_on_ui(std::function<nlohmann::json()> fn)
     task->fn        = std::move(fn);
     auto future     = task->promise->get_future();
     task->schedule();
-    if (future.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+    if (future.wait_for(std::chrono::seconds(timeout_s)) != std::future_status::ready) {
         task->cancelled->store(true);
         throw std::runtime_error("ui_timeout");
     }
@@ -706,9 +706,13 @@ Response Controller::handle_slice_cancel()
 }
 
 // M4a: POST /api/v1/model  body {"path":"<orca-host path>"}
-// v1 accepts only .stl/.obj/.3mf (loaded via LoadStrategy::LoadModel, no embedded
-// config). Other formats (esp. STEP) are rejected because their import path can pop
-// modal GUI dialogs that would wedge the single GUI thread with no remote way to dismiss.
+// Accepts .stl/.obj/.3mf/.step/.stp (loaded via LoadStrategy::LoadModel, no embedded
+// config). STEP import can raise modal dialogs that would wedge the single GUI
+// thread with no remote way to dismiss: StepMeshDialog and the non-UTF8 name
+// warning are gated by app-config flags forced safe for the duration of the load
+// (deflection defaults come from app config); the multipart-object prompt in
+// Plater::load_files is skipped while an API task is on the stack (keeps the
+// solids as separate objects, the dialog's No answer).
 Response Controller::handle_load_model(const std::string &body)
 {
     nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch route
@@ -723,18 +727,35 @@ Response Controller::handle_load_model(const std::string &body)
         size_t n = std::char_traits<char>::length(suf);
         return lower.size() >= n && lower.compare(lower.size() - n, n, suf) == 0;
     };
-    if (!(ends_with(".stl") || ends_with(".obj") || ends_with(".3mf"))) {
+    const bool is_step = ends_with(".step") || ends_with(".stp");
+    if (!(ends_with(".stl") || ends_with(".obj") || ends_with(".3mf") || is_step)) {
         api_notify("Can't load " + boost::filesystem::path(path).filename().string() + ": unsupported format", true);
         return { 422, {{"error", "unsupported_format"},
-                       {"detail", "remote load supports .stl, .obj, .3mf (v1)"}} };
+                       {"detail", "remote load supports .stl, .obj, .3mf, .step, .stp"}} };
     }
 
-    nlohmann::json r = run_on_ui([path]() -> nlohmann::json {
+    // 120 s instead of the default 10: OCCT read + tessellation of a real-world
+    // STEP (and mesh import of a very large STL) can exceed 10 s, and the load
+    // would still complete on the GUI thread after a ui_timeout was returned.
+    nlohmann::json r = run_on_ui([path, is_step]() -> nlohmann::json {
         if (!boost::filesystem::exists(path))
             return {{"error", "not_found"}};
         Plater *plater = wxGetApp().plater();
+        // Use the stored deflection defaults instead of StepMeshDialog and skip
+        // the non-UTF8 name warning while loading; restore the user's flags after.
+        AppConfig *cfg = wxGetApp().app_config;
+        const bool prev_mesh_dlg  = cfg->get_bool("enable_step_mesh_setting");
+        const bool prev_utf8_warn = cfg->get_bool("step_not_utf8_no_warn");
+        if (is_step) {
+            cfg->set_bool("enable_step_mesh_setting", false);
+            cfg->set_bool("step_not_utf8_no_warn", true);
+        }
         std::vector<size_t> idxs = plater->load_files(std::vector<std::string>{ path },
                                                       LoadStrategy::LoadModel);
+        if (is_step) {
+            cfg->set_bool("enable_step_mesh_setting", prev_mesh_dlg);
+            cfg->set_bool("step_not_utf8_no_warn", prev_utf8_warn);
+        }
         if (idxs.empty())
             return {{"error", "load_failed"}};
         nlohmann::json objects = nlohmann::json::array();
@@ -745,7 +766,7 @@ Response Controller::handle_load_model(const std::string &body)
                                {"size_mm", {sz.x(), sz.y(), sz.z()}}});
         }
         return {{"loaded", true}, {"objects", objects}};
-    });
+    }, /*timeout_s=*/120);
     std::string fn = boost::filesystem::path(path).filename().string();
     if (r.contains("error")) {
         api_notify("Couldn't load " + fn, true);

@@ -7664,7 +7664,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 // convert_model_if(model, answer_convert_from_imperial_units == wxID_YES);
             }
 
-             if (!is_project_file && model.looks_like_multipart_object()) {
+             // Remote API loads must not block on a modal; keep the solids as
+             // separate objects (the dialog's No answer) and let the client decide.
+             // The msgid below is upstream's current wording verbatim - the patch
+             // carried an older variant that would no longer match the catalogs.
+             if (!is_project_file && model.looks_like_multipart_object()
+                 && !RemoteAPI::Controller::api_ui_task_active()) {
                MessageDialog msg_dlg(q, _L("This file contains several objects positioned at multiple heights.\nInstead of considering them as multiple objects, should \nthe file be loaded as a single object with multiple parts\?") + "\n",
                     _L("Multi-part object detected"), wxICON_WARNING | wxYES | wxNO);
                 if (msg_dlg.ShowModal() == wxID_YES) {

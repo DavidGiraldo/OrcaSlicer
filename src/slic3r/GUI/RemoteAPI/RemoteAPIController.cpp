@@ -636,6 +636,17 @@ Response Controller::handle_slice()
         Plater *plater = wxGetApp().plater();
         if (plater->model().objects.empty())
             return {{"error", "nothing_to_slice"}};
+        // A prior validation failure (e.g. an object that sat outside the bed
+        // when the background process last ran) stays LATCHED on the plate
+        // (process_completed_with_error) and Plater::reslice() returns directly
+        // on it without re-validating. GUI edits clear the latch via the
+        // idle-time schedule_background_process() pump, but API-side model
+        // mutations never run it - so a once-invalid plate could never slice
+        // again over the API even after the geometry was fixed. Force a
+        // synchronous re-validation here: it clears the latch when the model
+        // has changed since the failure, and re-latches (-> slice_not_started
+        // below) when the plate is still genuinely unsliceable.
+        plater->update(false, /*force_background_processing_update=*/true);
         // reslice() no-ops on an already-valid plate -> no completion event ->
         // status would stick at "slicing". Report the existing result instead.
         if (plater->get_partplate_list().get_curr_plate()->is_slice_result_valid())

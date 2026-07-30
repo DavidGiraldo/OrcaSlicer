@@ -6051,7 +6051,7 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
         try { return std::stol(m[1].str()); } catch (...) { return -1; }
     };
 
-    auto http = Http::get("https://api.github.com/repos/MaxEllis/OrcaSlicer/releases/latest");
+    auto http = Http::get("https://api.github.com/repos/DavidGiraldo/OrcaSlicer/releases/latest");
     http.header("accept", "application/vnd.github.v3+json")
         .timeout_connect(5)
         .timeout_max(10)
@@ -6113,6 +6113,11 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
     return;
 
     // ---- stock update check below is intentionally unreachable ----
+    // Kept verbatim rather than deleted so upstream changes to this region still
+    // merge, and braced so its `http` does not collide with the fork check's one
+    // above - both are function-scope locals, and C++ rejects the redeclaration
+    // whether or not the second is reachable.
+    {
     AppConfig* app_config = wxGetApp().app_config;
     bool       check_stable_only = app_config->get_bool("check_stable_update_only");
     auto version_check_url = app_config->version_check_url();
@@ -6254,6 +6259,7 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
         });
 
     http.perform();
+    } // end of the unreachable stock update check
 }
 
 // return true if handled

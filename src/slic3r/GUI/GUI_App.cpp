@@ -5941,7 +5941,86 @@ void maybe_attach_updater_signature(Http& http, const std::string& canonical_que
 
 void GUI_App::check_new_version_sf(bool show_tips, int by_user)
 {
-    return; // orca-mcp: this fork must never self-update to stock OrcaSlicer (would remove the Remote API)
+    // orca-mcp: never check stock OrcaSlicer for updates (self-updating to stock
+    // would remove the Remote API). Check this fork's own releases instead, so
+    // users hear about new -mcp builds. Releases are compared by the mcp ordinal
+    // (the N in v<base>-mcp.N), which is monotonic across base-version bumps;
+    // semver alone cannot order two -mcp.N tags (the suffix regex stops at the
+    // dot, so mcp.5 and mcp.6 parse equal).
+    (void)show_tips;
+    if (app_config->get_stealth_mode())
+        return;
+
+    auto parse_mcp_ordinal = [](const std::string& tag) -> long {
+        static const std::regex mcp_tag("-mcp\\.([0-9]+)$");
+        std::smatch m;
+        if (!std::regex_search(tag, m, mcp_tag))
+            return -1;
+        try { return std::stol(m[1].str()); } catch (...) { return -1; }
+    };
+
+    auto http = Http::get("https://api.github.com/repos/MaxEllis/OrcaSlicer/releases/latest");
+    http.header("accept", "application/vnd.github.v3+json")
+        .timeout_connect(5)
+        .timeout_max(10)
+        .on_error([](std::string body, std::string error, unsigned http_status) {
+            (void)body;
+            BOOST_LOG_TRIVIAL(error) << format("Error getting: `%1%`: HTTP %2%, %3%",
+                                               "check_new_version_sf (fork releases)", http_status, error);
+        })
+        .on_complete([this, by_user, parse_mcp_ordinal](std::string body, unsigned http_status) {
+            if (http_status != 200)
+                return;
+            try {
+                boost::trim(body);
+                if (body.empty()) {
+                    if (by_user != 0)
+                        this->no_new_version();
+                    return;
+                }
+
+                boost::property_tree::ptree root;
+                std::stringstream           json_stream(body);
+                boost::property_tree::read_json(json_stream, root);
+
+                const std::string tag            = root.get_optional<std::string>("tag_name").get_value_or("");
+                const long        latest_ordinal = parse_mcp_ordinal(tag);
+                if (latest_ordinal <= ORCA_MCP_RELEASE) {
+                    if (by_user != 0)
+                        this->no_new_version();
+                    return;
+                }
+
+                // The EVT_SLIC3R_VERSION_ONLINE handler compares skip_version
+                // LEXICOGRAPHICALLY ("v...mcp.10" <= "v...mcp.9"), so resolve the
+                // skip numerically here and clear a stale skip before posting.
+                const std::string skip_version = this->app_config->get("app", "skip_version");
+                if (!skip_version.empty()) {
+                    if (latest_ordinal <= parse_mcp_ordinal(skip_version)) {
+                        if (by_user != 0)
+                            this->no_new_version();
+                        return;
+                    }
+                    this->app_config->set("skip_version", "");
+                }
+
+                version_info.url           = root.get_optional<std::string>("html_url").get_value_or("");
+                version_info.version_str   = tag;
+                version_info.description   = root.get_optional<std::string>("body").get_value_or("");
+                version_info.force_upgrade = false;
+
+                wxCommandEvent* evt = new wxCommandEvent(EVT_SLIC3R_VERSION_ONLINE);
+                evt->SetString(tag);
+                if (by_user != 0)
+                    evt->SetInt(by_user);
+                GUI::wxGetApp().QueueEvent(evt);
+            } catch (...) {}
+        });
+
+    http.perform();
+    return;
+
+    // ---- stock update check below is intentionally unreachable ----
     AppConfig* app_config = wxGetApp().app_config;
     bool       check_stable_only = app_config->get_bool("check_stable_update_only");
     auto version_check_url = app_config->version_check_url();

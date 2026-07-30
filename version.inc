@@ -10,10 +10,14 @@ endif()
 set(SoftFever_VERSION "2.5.0-dev")
 
 # orca-mcp: monotonically increasing fork release ordinal (the N in v<base>-mcp.N
-# release tags on MaxEllis/OrcaSlicer). The in-app update check compares this
-# against the latest GitHub release tag; scripts/cut-fork-release.sh bumps it
-# at release time. It is monotonic ACROSS base-version bumps (mcp.4 was 2.3.2).
-set(ORCA_MCP_RELEASE "4")
+# release tags on DavidGiraldo/OrcaSlicer). The in-app update check compares this
+# against the latest GitHub release tag, and it is monotonic ACROSS base-version
+# bumps, because semver alone cannot order two -mcp.N tags.
+# 0 means "no fork release cut yet" - bump it to N when tagging v<base>-mcp.N.
+# (Upstream ships 4 here, matching MaxEllis/OrcaSlicer's own release history;
+# keeping that number would make this build claim to be newer than our first
+# release and suppress the very prompt the check exists for.)
+set(ORCA_MCP_RELEASE "0")
 string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)"
        SoftFever_VERSION_MATCH ${SoftFever_VERSION})
 set(ORCA_VERSION_MAJOR ${CMAKE_MATCH_1})

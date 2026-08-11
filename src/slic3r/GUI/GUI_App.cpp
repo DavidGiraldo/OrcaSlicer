@@ -6039,7 +6039,16 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
     // (the N in v<base>-mcp.N), which is monotonic across base-version bumps;
     // semver alone cannot order two -mcp.N tags (the suffix regex stops at the
     // dot, so mcp.5 and mcp.6 parse equal).
+    // Scoped: the stock implementation below is left intact (unreachable) to keep
+    // the diff against upstream small for future rebases, and it declares its own
+    // `http` in this same function scope - which is a hard redefinition error even
+    // though it can never run. The braces keep the two sets of locals apart.
+    {
     (void)show_tips;
+    // Deliberate divergence from upstream, which does not gate this call on
+    // stealth mode: every other network path in the app does (8 call sites), and
+    // polling api.github.com is a network call. Stealth is the user's explicit
+    // opt-out, so it wins over hearing about fork releases.
     if (app_config->get_stealth_mode())
         return;
 
@@ -6111,13 +6120,11 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
 
     http.perform();
     return;
+    }
 
     // ---- stock update check below is intentionally unreachable ----
     // Kept verbatim rather than deleted so upstream changes to this region still
-    // merge, and braced so its `http` does not collide with the fork check's one
-    // above - both are function-scope locals, and C++ rejects the redeclaration
-    // whether or not the second is reachable.
-    {
+    // merge cleanly.
     AppConfig* app_config = wxGetApp().app_config;
     bool       check_stable_only = app_config->get_bool("check_stable_update_only");
     auto version_check_url = app_config->version_check_url();
@@ -6259,7 +6266,6 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
         });
 
     http.perform();
-    } // end of the unreachable stock update check
 }
 
 // return true if handled

@@ -456,7 +456,8 @@ static std::string colour_list_error(const std::string &s)
 static std::string project_value_error(const std::string        &key,
                                        const DynamicPrintConfig &staged,
                                        int                       nozzles,
-                                       size_t                    filaments_before)
+                                       size_t                    filaments_before,
+                                       const BoundingBoxf       &bed)
 {
     auto floats_of = [&staged](const std::string &k) -> std::vector<double> {
         const auto *o = staged.option<ConfigOptionFloats>(k);
@@ -509,10 +510,26 @@ static std::string project_value_error(const std::string        &key,
         return {};
     }
     if (key == "wipe_tower_x" || key == "wipe_tower_y") {
+        // Upstream deleted the render-time clamp that used to pull an out-of-bed
+        // tower back on, on the stated grounds that "the stored position is
+        // already clamped onto the bed, by set_default_wipe_tower_pos_for_plate
+        // and again on every drag" (GLCanvas3D::reload_scene). Those are the two
+        // writers it knows about; this API is a third, so the invariant is ours
+        // to keep now. Reject rather than silently relocate the tower - the rest
+        // of this handler validates, it never coerces.
         const std::vector<double> v = floats_of(key);
-        for (double d : v)
+        const bool  is_x = (key == "wipe_tower_x");
+        const double lo  = is_x ? bed.min.x() : bed.min.y();
+        const double hi  = is_x ? bed.max.x() : bed.max.y();
+        for (double d : v) {
             if (!std::isfinite(d))
                 return "must be a finite number";
+            if (hi > lo && (d < lo || d > hi)) {
+                std::ostringstream ss;
+                ss << "off the bed: " << d << " is outside [" << lo << ", " << hi << "]";
+                return ss.str();
+            }
+        }
         return {};
     }
     return {};
@@ -560,6 +577,15 @@ Response Controller::handle_put_config(const std::string &body)
         DynamicPrintConfig     proj_new = bundle->project_config;
         std::set<std::string>  proj_keys;
         const int              nozzles  = bundle->get_printer_extruder_count();
+        // Plate-local bed bounds, for the wipe-tower position check. printable_area
+        // is a printer-preset key, so it is not in project_config and has to come
+        // from here. An empty/unreadable area leaves the box degenerate, which the
+        // check treats as "cannot judge" rather than "reject everything".
+        BoundingBoxf bed;
+        if (const auto *area = bundle->printers.get_edited_preset().config
+                                     .option<ConfigOptionPoints>("printable_area"))
+            for (const Vec2d &p : area->values)
+                bed.merge(p);
         const auto            *colours0 = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
         const size_t           filaments_before = colours0 == nullptr ? 0 : colours0->values.size();
         const int              plate_idx = wxGetApp().plater()->get_partplate_list().get_curr_plate_index();
@@ -645,7 +671,7 @@ Response Controller::handle_put_config(const std::string &body)
         // cross-key (the matrix size depends on filament_colour), so they can only
         // be judged once the whole batch is written, not as each key arrives.
         for (const std::string &key : proj_keys) {
-            std::string err = project_value_error(key, proj_new, nozzles, filaments_before);
+            std::string err = project_value_error(key, proj_new, nozzles, filaments_before, bed);
             if (!err.empty()) errors[key] = err;
         }
 

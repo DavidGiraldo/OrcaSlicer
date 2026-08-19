@@ -1,3 +1,10 @@
-github: SoftFever
-ko_fi: SoftFever
-custom: https://paypal.me/softfever3d
+# orca-mcp: neutralised on this fork. The inherited values solicited sponsorship
+# for SoftFever (upstream's maintainer) from the Sponsor button on *this* repo -
+# the same inherited-identity problem as winget_updater.yml's SoftFever.OrcaSlicer
+# package id. Left in place, emptied, rather than deleted: keeping the path means
+# upstream edits merge cleanly, and no uncommented key means no Sponsor button.
+# To enable sponsorship for this fork, uncomment one and put your own handle in.
+#
+# github: SoftFever
+# ko_fi: SoftFever
+# custom: https://paypal.me/softfever3d

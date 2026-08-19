@@ -1,4 +1,10 @@
 name: Assign Issue
+# orca-mcp: inherited from upstream OrcaSlicer. Every job below is gated on
+# github.repository so this issue/PR automation stays inert on the fork - it
+# speaks with the upstream project's voice (labels, bot comments, auto-close)
+# and targets whichever repo it runs in. Guarding rather than deleting keeps
+# the file mergeable with upstream, and matches upstream's own idiom (18 uses
+# across build_all.yml, build_orca.yml, doxygen-docs.yml, pr-merge-bot.yml).
 
 on:
   schedule:
@@ -9,6 +15,7 @@ on:
 
 jobs:
   assign:
+    if: github.repository == 'OrcaSlicer/OrcaSlicer'
     permissions:
       issues: write
     runs-on: ubuntu-latest

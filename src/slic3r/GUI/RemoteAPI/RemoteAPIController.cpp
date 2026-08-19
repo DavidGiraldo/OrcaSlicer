@@ -349,12 +349,39 @@ static std::string json_value_to_config_string(const nlohmann::json &v)
     throw std::runtime_error("unsupported value type");
 }
 
+// A vector option that deserialized to ZERO elements is a live crash, not a
+// validation failure. ConfigOptionVector::get_at and ::set_to_index both read
+// values.front() with no empty check (Config.hpp), and of the vector types only
+// ConfigOptionFloatsTempl guards the empty string - coFloatsOrPercents, coInts,
+// coBools and coPoints clear their vector and still return true. Print::apply
+// clones the option, so the empty vector reaches slicing with data() == nullptr
+// and faults on the first read. The GUI cannot reach this state (it writes typed
+// values through set_at, and its float parse throws on ""), so this API is the
+// writer that has to check.
+//
+// Emptiness is legitimate exactly where the definition's own default is empty,
+// e.g. post_process - "no scripts" is a real value there. Calibrating against
+// the default keeps that working without an explicit key list to maintain.
+static std::string empty_vector_error(const std::string &key, const DynamicPrintConfig &staged)
+{
+    const auto *vec = dynamic_cast<const ConfigOptionVectorBase *>(staged.option(key));
+    if (vec == nullptr || !vec->empty())
+        return {};
+    const ConfigOptionDef *def = print_config_def.get(key);
+    if (def != nullptr)
+        if (const auto *dflt = dynamic_cast<const ConfigOptionVectorBase *>(def->default_value.get()))
+            if (dflt->empty())
+                return {};
+    return "expected at least one value, got an empty list";
+}
+
 // ---------------------------------------------------------------------------
 // Project-scope writes (CFS / multi-material)
 //
-// PresetBundle::project_config holds the ~19 keys of s_project_options, but
-// opening all of them would be unsafe. Their consumers index them with unchecked
-// arithmetic whose bound comes from a DIFFERENT vector, so a wrong-length write
+// PresetBundle::project_config holds the keys of s_project_options - 18 today,
+// every one of them named by the two lists below - but opening all of them would
+// be unsafe. Their consumers index them with unchecked arithmetic whose bound
+// comes from a DIFFERENT vector, so a wrong-length write
 // is an out-of-bounds heap access rather than a validation failure - e.g.
 // Sidebar::auto_calc_flushing_volumes sizes its loop from filament_colour and
 // writes flush_volumes_matrix at [n*from + to] (Plater.cpp), and
@@ -414,7 +441,9 @@ static std::string numeric_list_error(const std::string &s)
         tok                = (b == std::string::npos) ? std::string() : tok.substr(b, e - b + 1);
         try {
             size_t pos = 0;
-            std::stod(tok, &pos);
+            // The parsed value is deliberately dropped: this only decides whether
+            // the token is a number at all. stod is [[nodiscard]], hence the cast.
+            static_cast<void>(std::stod(tok, &pos));
             if (pos != tok.size())
                 throw std::invalid_argument("trailing characters");
         } catch (const std::exception &) {
@@ -570,10 +599,11 @@ Response Controller::handle_put_config(const std::string &body)
         nlohmann::json errors  = nlohmann::json::object();
         std::vector<std::array<std::string, 3>> changes; // key, old, new -> notification
 
-        // Project scope (CFS / multi-material) is staged on its own copy. It is
-        // checked AFTER the three presets so wipe_tower_rotation_angle - the one
-        // key that lives in both s_project_options and the print preset - keeps
-        // routing to the print preset exactly as it did before.
+        // Project scope (CFS / multi-material) is staged on its own copy, and is
+        // checked AFTER the three presets so that a key present in both lists keeps
+        // routing to the preset. Upstream 542cd18d19 dropped the only such key,
+        // wipe_tower_rotation_angle, from s_project_options, so the intersection is
+        // empty today - the order stays as the guard for the next overlap.
         DynamicPrintConfig     proj_new = bundle->project_config;
         std::set<std::string>  proj_keys;
         const int              nozzles  = bundle->get_printer_extruder_count();
@@ -659,6 +689,8 @@ Response Controller::handle_put_config(const std::string &body)
                 // Orca's own validation: throws BadOptionTypeException /
                 // BadOptionValueException on garbage.
                 tgt->cfg.set_deserialize_strict(key, sval);
+                if (std::string ee = empty_vector_error(key, tgt->cfg); !ee.empty())
+                    throw std::runtime_error(ee);
                 tgt->touched = true;
                 applied.push_back(key);
                 changes.push_back({ key, oldv, tgt->cfg.opt_serialize(key) });
@@ -1740,6 +1772,8 @@ Response Controller::handle_put_object_config(uint64_t id, const std::string &bo
             if (print_config_def.get(key) == nullptr) { errors[key] = "unknown_key"; continue; }
             try {
                 cfg.set_deserialize_strict(key, json_value_to_config_string(it.value()));
+                if (std::string ee = empty_vector_error(key, cfg); !ee.empty())
+                    throw std::runtime_error(ee);
                 applied.push_back(key);
             } catch (const std::exception &e) { errors[key] = e.what(); }
         }

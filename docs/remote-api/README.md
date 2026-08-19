@@ -123,6 +123,25 @@ in `PUT`) and report why: `values_are_unchecked_extruder_indices` (`filament_map
 (`flush_volumes_vector`), `live_printer_state_not_a_setting`
 (`has_filament_switcher`, `enable_filament_dynamic_map`).
 
+Two keys became *live* through this API in OrcaSlicer 2.5 and were inert before,
+so a recipe written against an older build now has effects it did not have:
+
+- **`wipe_tower_rotation_angle`** used to sit in both the project config and the
+  print preset. `PUT /config` writes the preset, while the slicer read the
+  project copy, so the write reported `applied` and changed nothing. Upstream
+  removed the project copy, so it now rotates the tower for real. Unlike
+  `wipe_tower_x`/`wipe_tower_y` it is *not* bounds-checked here: a rotation that
+  puts the tower off the bed surfaces as a slice validation error instead.
+- **`sparse_infill_smooth_factor`** applied only to Hilbert Curve infill.
+  It now applies to Octagram Spiral, Lightning, Honeycomb, 3D Honeycomb,
+  Concentric and Cross Hatch as well - and Cross Hatch is the default pattern -
+  plus Grid, Triangles and Tri-hexagon when `fill_multiline > 1`.
+
+Vector keys reject an empty list. `""` deserializes to *zero* elements for most
+vector types and the slicer then reads element 0 unguarded, so an empty write is
+a crash rather than a way to clear a value; there is no clear-a-key operation.
+Keys whose own default is an empty list, such as `post_process`, are exempt.
+
 ### POST /slice
 
 ```bash

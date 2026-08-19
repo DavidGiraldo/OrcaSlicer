@@ -1,4 +1,10 @@
 name: Post profile check comment
+# orca-mcp: inherited from upstream OrcaSlicer. Every job below is gated on
+# github.repository so this issue/PR automation stays inert on the fork - it
+# speaks with the upstream project's voice (labels, bot comments, auto-close)
+# and targets whichever repo it runs in. Guarding rather than deleting keeps
+# the file mergeable with upstream, and matches upstream's own idiom (18 uses
+# across build_all.yml, build_orca.yml, doxygen-docs.yml, pr-merge-bot.yml).
 
 # NOTE: The workflow name in the 'workflows' filter below must match the 'name'
 # field in check_profiles.yml exactly. If that name changes, update it here too.
@@ -22,7 +28,7 @@ jobs:
   post_comment:
     name: Post PR comment
     runs-on: ubuntu-24.04
-    if: ${{ github.event.workflow_run.event == 'pull_request' && (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure') }}
+    if: ${{ github.repository == 'OrcaSlicer/OrcaSlicer' && (github.event.workflow_run.event == 'pull_request' && (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')) }}
     steps:
       - name: Download artifact
         id: download

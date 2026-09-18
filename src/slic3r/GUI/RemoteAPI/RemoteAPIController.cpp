@@ -378,8 +378,8 @@ static std::string empty_vector_error(const std::string &key, const DynamicPrint
 // ---------------------------------------------------------------------------
 // Project-scope writes (CFS / multi-material)
 //
-// PresetBundle::project_config holds the keys of s_project_options - 18 today,
-// every one of them named by the two lists below - but opening all of them would
+// PresetBundle::project_config holds the keys of s_project_options - a list that
+// grows with upstream - but opening all of them would
 // be unsafe. Their consumers index them with unchecked arithmetic whose bound
 // comes from a DIFFERENT vector, so a wrong-length write
 // is an out-of-bounds heap access rather than a validation failure - e.g.
@@ -1725,6 +1725,9 @@ Response Controller::handle_transform_object(uint64_t id, const std::string &bod
         if (has_t) mi->set_offset(mi->get_offset() + tr);
         if (has_r) mi->set_rotation(mi->get_rotation() + ro * 0.017453292519943295); // deg->rad
         if (has_s) mi->set_scaling_factor(sc);
+        // A translate can carry the instance onto a different plate, so re-register it
+        // with the plate list the way upstream's own move path now does.
+        plater->get_partplate_list().notify_instance_update(idx, 0);
         plater->changed_object(idx);
         api_notify(std::string(has_t ? "Moved" : (has_r ? "Rotated" : "Resized")) + " '" + mo->name + "'");
         auto off = mi->get_offset(); auto rot = mi->get_rotation(); auto scl = mi->get_scaling_factor();
@@ -1749,6 +1752,12 @@ Response Controller::handle_duplicate_object(uint64_t id)
         const ModelInstance *src = mo->instances.front();
         Vec3d off = src->get_offset() + Vec3d(10.0, 10.0, 0.0);
         mo->add_instance(off, src->get_scaling_factor(), src->get_rotation(), src->get_mirror());
+        // Upstream's increase_instances registers every new copy with the plate it
+        // lands on (Plater.cpp, "Register Instance Copies and Moves with Their Plate"),
+        // because the plate's filament list and wipe tower preview are read from that
+        // registry. changed_object() does not touch it, so do it here too - otherwise a
+        // duplicate is saved on no plate and gets no prime tower.
+        plater->get_partplate_list().notify_instance_update(idx, (int) mo->instances.size() - 1);
         plater->changed_object(idx);
         api_notify("Duplicated '" + mo->name + "'");
         return {{"duplicated", true}, {"id", id}, {"instances", (unsigned) mo->instances.size()}};

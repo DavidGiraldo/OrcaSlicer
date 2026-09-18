@@ -168,7 +168,7 @@ private:
     void OnPaint(wxPaintEvent&)
     {
         wxPaintDC dc(this);
-        // Transparent - draw nothing
+        // Transparent — draw nothing
     }
 
     GdkWindowEdge get_gdk_edge(const wxPoint& pos) const
@@ -1212,7 +1212,7 @@ void MainFrame::shutdown()
     if (m_plater != nullptr)
         m_plater->remove_dock_panes();
 #ifdef __WXGTK__
-    // Edge panels are child windows - wxWidgets destroys them automatically.
+    // Edge panels are child windows — wxWidgets destroys them automatically.
     m_edge_bottom = nullptr;
     m_edge_left   = nullptr;
     m_edge_right  = nullptr;

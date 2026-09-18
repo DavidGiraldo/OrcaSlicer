@@ -268,7 +268,7 @@ static string get_diameter_string(float diameter)
     std::string s = stream.str();
     if (s.find('.') != std::string::npos) {   // Remove trailing zeros, but keep at least one decimal if needed
         s.erase(s.find_last_not_of('0') + 1);
-        if (s.back() == '.') s += '0';        // Ensure "1." -> "1.0"
+        if (s.back() == '.') s += '0';        // Ensure "1." → "1.0"
     }
     return s;
 }
@@ -5655,7 +5655,7 @@ void Sidebar::on_bed_type_change(BedType bed_type)
  *       ↓
  *   MachineObject::parse_json() (updates device state)
  *       ├── vt_slot (std::vector<DevAmsTray>) - virtual tray data for external filament
- *       └── DevFilaSystem -> DevAms -> DevAmsTray - AMS unit hierarchy
+ *       └── DevFilaSystem → DevAms → DevAmsTray - AMS unit hierarchy
  *       ↓
  *   build_filament_ams_list() [THIS FUNCTION] - aggregates into DynamicPrintConfig maps
  *

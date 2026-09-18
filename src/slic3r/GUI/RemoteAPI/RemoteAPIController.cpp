@@ -1115,8 +1115,11 @@ Response Controller::handle_load_model(const std::string &body)
             cfg->set_bool("enable_step_mesh_setting", false);
             cfg->set_bool("step_not_utf8_no_warn", true);
         }
-        std::vector<size_t> idxs = plater->load_files(std::vector<std::string>{ path },
-                                                      LoadStrategy::LoadModel);
+        // Upstream dropped the std::vector<std::string> overload of load_files;
+        // it only wrapped each string in an fs::path, so this is the same call.
+        std::vector<size_t> idxs = plater->load_files(
+            std::vector<boost::filesystem::path>{ boost::filesystem::path(path) },
+            LoadStrategy::LoadModel);
         if (is_step) {
             cfg->set_bool("enable_step_mesh_setting", prev_mesh_dlg);
             cfg->set_bool("step_not_utf8_no_warn", prev_utf8_warn);

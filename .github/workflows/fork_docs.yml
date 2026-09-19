@@ -1,0 +1,56 @@
+name: Fork docs
+# orca-mcp: owned by this fork, not inherited from upstream. Gated on
+# github.repository so it stays inert anywhere else, matching the idiom the
+# inherited workflows use.
+#
+# The Remote API reference rotted once already: it documented 6 endpoints while
+# the dispatcher served 24, and the OpenAPI schema was never touched after the
+# commit that introduced it. A prose rule did not prevent that, so this job
+# enforces it. See docs/fork/AGENTS.md.
+
+on:
+  pull_request:
+    paths:
+      - 'src/slic3r/GUI/RemoteAPI/**'
+
+permissions:
+  contents: read
+
+jobs:
+  reference-updated:
+    if: github.repository == 'DavidGiraldo/OrcaSlicer'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: The Remote API reference must move with its code
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed=$(git diff --name-only "$base" "$head")
+
+          echo "$changed" | grep -q '^src/slic3r/GUI/RemoteAPI/' || {
+            echo "No Remote API source changed; nothing to check."; exit 0; }
+
+          if echo "$changed" | grep -qE '^docs/(remote-api/|HLSD/remote-api\.md)'; then
+            echo "Remote API documentation was updated alongside the code."
+            exit 0
+          fi
+
+          cat >&2 <<'MSG'
+          This pull request changes src/slic3r/GUI/RemoteAPI/ without touching any of:
+
+            docs/remote-api/README.md     the endpoint reference
+            docs/remote-api/openapi.yaml  the schema
+            docs/HLSD/remote-api.md       the design
+
+          Update whichever the change affects, in this same pull request.
+
+          If the change genuinely alters none of them - an internal refactor with
+          no observable contract change - say so in the pull request description
+          and a reviewer can merge past this check.
+          MSG
+          exit 1

@@ -55,3 +55,7 @@ __pycache__/
 /.test/
 docs/superpowers/
 ctest_results.xml
+# orca-mcp: local a esta maquina, no del proyecto.
+/command
+/.agents/
+/.codex/

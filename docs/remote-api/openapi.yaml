@@ -2,21 +2,35 @@ openapi: 3.0.3
 info:
   title: OrcaSlicer Remote API
   version: "1.0"
+  license:
+    name: AGPL-3.0-or-later
+    url: https://www.gnu.org/licenses/agpl-3.0.html
   description: |
     Token-authenticated HTTP + WebSocket API embedded in OrcaSlicer, exposing the
-    running application for automation (status, live config read/write, slicing,
-    and an event stream).
+    running application for automation: status, live config read/write, model
+    loading, object manipulation, preset management, slicing, plate rendering and
+    an event stream.
 
     **Enabling:** Preferences → *Remote API*: enable, choose LAN vs localhost,
     port (default 13130), and copy/regenerate the token. Off by default.
 
-    **Auth:** every HTTP request must send `X-Api-Token: <token>`. The WebSocket
-    endpoint authenticates via a `?token=<token>` query parameter (browser WS
-    clients cannot set request headers).
+    **Auth:** every HTTP request must send `X-Api-Token: <token>` (a bare value,
+    not a `Bearer` scheme). No route is exempt: authentication runs before
+    routing, so an unknown path without a valid token returns 401, not 404. The
+    WebSocket authenticates via a `?token=<token>` query parameter, because
+    browser WS clients cannot set request headers.
 
-    **Threading note:** the server runs a single I/O thread and dispatches most
-    endpoints onto the GUI thread with a 10s timeout (`504 ui_timeout`). Treat the
-    API as single-client; concurrent heavy calls serialize.
+    **Threading:** the server runs a single I/O thread and dispatches most
+    endpoints onto the GUI thread with a 10s timeout (`504 ui_timeout`).
+    `POST /model` allows 120s and `GET /plate/render` 30s. A timed-out request is
+    cancelled before it runs, so it does not apply its effects afterwards. Treat
+    the API as single-client; concurrent heavy calls serialize.
+
+    **Limits:** request bodies are capped at 4 MiB; sockets time out after 15s of
+    inactivity; connections are not kept alive.
+
+    See docs/HLSD/remote-api.md for the design, and docs/remote-api/README.md for
+    the annotated reference.
 servers:
   - url: http://{host}:{port}/api/v1
     variables:
@@ -24,9 +38,31 @@ servers:
       port: { default: "13130" }
 security:
   - ApiToken: []
+
+tags:
+  - name: status
+    description: What the application and the current project are doing.
+  - name: config
+    description: Reading and writing slicer settings.
+  - name: slice
+    description: Starting, following and cancelling a slice, and fetching its G-code.
+  - name: model
+    description: Loading model files from the host filesystem.
+  - name: presets
+    description: Listing, selecting, saving, reading and deleting presets.
+  - name: objects
+    description: Inspecting and manipulating the objects on the plate.
+  - name: jobs
+    description: Arrange and orient, which run on the UI job worker.
+  - name: render
+    description: Offscreen PNG renders of the plate and the toolpaths.
+  - name: events
+    description: The WebSocket push stream.
+
 paths:
   /status:
     get:
+      tags: [status]
       summary: Application + project status
       operationId: getStatus
       responses:
@@ -36,93 +72,103 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Status" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
   /config:
     get:
-      summary: Read the merged (full) config
+      tags: [config]
+      summary: Read configuration values
       operationId: getConfig
       description: |
-        Returns the secure merged config (secrets redacted) as canonical string
-        values (same form as `.ini`/`.3mf`). Optionally filter with `?keys=`.
+        Values are always strings, in the canonical serialized form used by .ini
+        and .3mf. Keys that do not exist are omitted rather than reported.
+
+        `keys` must be the first and only query parameter: the handler takes
+        everything after `?keys=` to the end of the target.
       parameters:
         - name: keys
           in: query
           required: false
+          description: Comma-separated config keys. Omit for the full config.
           schema: { type: string }
-          description: Comma-separated key list, e.g. `layer_height,wall_loops`.
           example: layer_height,wall_loops
       responses:
         "200":
-          description: Config map.
+          description: The requested keys.
           content:
             application/json:
               schema:
                 type: object
+                required: [config]
                 properties:
                   config:
                     type: object
                     additionalProperties: { type: string }
-                    example: { layer_height: "0.2", wall_loops: "2" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
     put:
-      summary: Apply config changes (live)
+      tags: [config]
+      summary: Write configuration values (atomic)
       operationId: putConfig
       description: |
-        Applies key/value edits through the GUI's own edit path (dirty markers +
-        live panel refresh + slice invalidation), exactly as if typed in the UI.
+        A flat object of key to value. Values may be strings, booleans, integers
+        or floats; booleans become "1" and "0". Keys are routed to the first
+        config that accepts them, in the order print, filament, printer, then the
+        project config.
 
-        **Atomic:** if ANY key is unknown or fails validation, NOTHING is applied
-        and the response is `422` with per-key reasons. On full success the
-        response is `200` with every applied key.
+        The write is atomic: if any key fails validation nothing is applied.
 
-        Values may be JSON strings, numbers, or booleans; they are coerced to the
-        canonical config string form.
+        Project-scope keys are governed by a default-deny allow-list. Only
+        flush_volumes_matrix, flush_multiplier, flush_multiplier_fast,
+        filament_colour, curr_bed_type, prime_volume_mode, wipe_tower_x and
+        wipe_tower_y are writable, each with its own invariant. wipe_tower_x and
+        wipe_tower_y take a single number written into the per-plate vector at
+        the current plate index, not a whole-vector replacement.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              additionalProperties: true
-            example: { layer_height: 0.28, wall_loops: 3 }
+              additionalProperties:
+                oneOf:
+                  - { type: string }
+                  - { type: boolean }
+                  - { type: number }
+              example: { layer_height: 0.24, wall_loops: 3 }
       responses:
         "200":
-          description: All keys applied.
+          description: Every key applied.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/ConfigApplyResult" }
-              example: { applied: ["layer_height", "wall_loops"], errors: {} }
-        "422":
-          description: At least one key invalid — nothing applied.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ConfigApplyResult" }
-              example: { applied: [], errors: { layer_height: "value out of range", bogus_key: "unknown_key" } }
-        "400":
-          description: Malformed body.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              examples:
-                not_object: { value: { error: "body_must_be_object" } }
-                bad_json:   { value: { error: "invalid_json" } }
+              schema: { $ref: "#/components/schemas/ConfigWriteResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: |
+            Validation failed; nothing was applied. `errors` maps each failing key
+            to a reason, such as `unknown_key`,
+            `not_editable_in_current_config`, `key_dropped_by_legacy_handler`,
+            `unsupported value type`,
+            `expected at least one value, got an empty list`, a project-scope
+            block reason like `not_writable_project_key`, or the text thrown by
+            the strict deserializer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigWriteResult" }
         "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
   /slice:
     post:
+      tags: [slice]
       summary: Start slicing the current plate
       operationId: startSlice
-      description: |
-        Triggers a reslice of the current plate. Progress and completion are
-        delivered as `slice.*` WebSocket events and via `GET /slice/status`.
       responses:
-        "202":
-          description: Slicing started.
-          content:
-            application/json:
-              schema: { type: object, properties: { started: { type: boolean, enum: [true] } } }
-              example: { started: true }
         "200":
-          description: Plate already sliced (valid result) — nothing to do.
+          description: The plate already holds a valid slice result; nothing started.
           content:
             application/json:
               schema:
@@ -130,170 +176,977 @@ paths:
                 properties:
                   started: { type: boolean, enum: [false] }
                   already_valid: { type: boolean, enum: [true] }
-              example: { started: false, already_valid: true }
-        "409":
-          description: A slice is already in progress.
+        "202":
+          description: Slicing started.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example: { error: "already_slicing" }
-        "422":
-          description: Nothing to slice (no objects on the plate).
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example: { error: "nothing_to_slice" }
+              schema:
+                type: object
+                properties:
+                  started: { type: boolean, enum: [true] }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: A slice is already running (`already_slicing`).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "422":
+          description: |
+            `nothing_to_slice` when the model holds no objects, or
+            `slice_not_started` when the plate cannot be sliced (object outside
+            the bed, or a latched invalid state).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
   /slice/status:
     get:
-      summary: Current/last slice state
+      tags: [slice]
+      summary: Slice state, progress, statistics and warnings
       operationId: getSliceStatus
+      description: |
+        Reads a mutex-guarded snapshot without touching the GUI thread, so this
+        endpoint never returns 504.
       responses:
         "200":
-          description: Slice state snapshot. `stats` present once done; `warnings` always present (may be empty).
+          description: Current slice snapshot.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SliceStatus" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /slice/cancel:
+    post:
+      tags: [slice]
+      summary: Cancel a running slice
+      operationId: cancelSlice
+      responses:
+        "200":
+          description: "`cancelled` reports whether a slice was actually running."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cancelled]
+                properties:
+                  cancelled: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /model:
+    post:
+      tags: [model]
+      summary: Load a model file from the host filesystem
+      operationId: loadModel
+      description: |
+        The path is resolved on the machine running OrcaSlicer. Any configuration
+        embedded in a .3mf is ignored (LoadModel only).
+
+        Allows 120 seconds instead of the usual 10, because reading and
+        tessellating a real STEP file legitimately takes longer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                  description: Host path ending in .stl, .obj, .3mf, .step or .stp.
+                  example: "C:/models/part.stl"
+      responses:
+        "200":
+          description: Loaded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  loaded: { type: boolean }
+                  objects:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: { type: integer }
+                        name: { type: string }
+                        size_mm: { $ref: "#/components/schemas/Vec3" }
+        "400":
+          description: "`invalid_json`, or `missing_path` when the body has no string `path`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`not_found` — the path does not exist."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "422":
+          description: "`unsupported_format` or `load_failed`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /presets:
+    get:
+      tags: [presets]
+      summary: List presets by type
+      operationId: getPresets
+      description: Default presets are omitted.
+      responses:
+        "200":
+          description: Presets grouped by type.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  print:    { type: array, items: { $ref: "#/components/schemas/PresetListItem" } }
+                  filament: { type: array, items: { $ref: "#/components/schemas/PresetListItem" } }
+                  printer:  { type: array, items: { $ref: "#/components/schemas/PresetListItem" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /preset:
+    put:
+      tags: [presets]
+      summary: Select a preset
+      operationId: selectPreset
+      description: |
+        Unsaved changes in the edited presets are discarded first, so the
+        selection cannot block on the modal unsaved-changes dialog.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PresetRef" }
+      responses:
+        "200":
+          description: Selected.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  selected: { type: string }
+        "400":
+          description: "`invalid_json`, `missing_fields` or `unknown_type`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: "`unknown_preset`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500":
+          description: "`tab_unavailable` or `select_cancelled`, plus the generic `internal`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    delete:
+      tags: [presets]
+      summary: Delete a user preset
+      operationId: deletePreset
+      description: Takes a request body, which some HTTP clients disallow on DELETE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PresetRef" }
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: string }
+        "400":
+          description: "`invalid_json`, `missing_fields` or `unknown_type`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`unknown_preset`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: |
+            `builtin_preset`, `preset_selected` (select another preset first) or
+            `has_children` (other presets inherit from this one).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500":
+          description: "`delete_failed`, plus the generic `internal`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /preset/save:
+    post:
+      tags: [presets]
+      summary: Save the edited preset under a name
+      operationId: savePreset
+      description: |
+        The name is trimmed, must be at most 128 characters, and may not be
+        empty, "." or "..", contain any of `<>[]:/\|?*"`, or contain a control
+        character.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/PresetRef"
+                - type: object
+                  properties:
+                    detach: { type: boolean, default: false }
+      responses:
+        "200":
+          description: "`created` reports whether the preset is new."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved:   { type: string }
+                  created: { type: boolean }
+        "400":
+          description: "`invalid_json`, `missing_fields`, `unknown_type` or `invalid_name`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`name_reserved` — the target name is a system or default preset."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500":
+          description: "`tab_unavailable` or `save_failed`, plus the generic `internal`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /preset/config:
+    post:
+      tags: [presets]
+      summary: Read a named preset's configuration
+      operationId: getPresetConfig
+      description: |
+        Read-only. A POST rather than a GET so that preset names containing
+        spaces or "@" need no URL encoding.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PresetRef" }
+      responses:
+        "200":
+          description: The preset's serialized configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:   { type: string }
+                  system: { type: boolean }
+                  config:
+                    type: object
+                    additionalProperties: { type: string }
+        "400":
+          description: "`invalid_json`, `missing_fields` or `unknown_type`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`unknown_preset`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /objects:
+    get:
+      tags: [objects]
+      summary: List objects on the plate
+      operationId: getObjects
+      responses:
+        "200":
+          description: |
+            `transform` describes instance 0 only, and its `rotation` is in
+            radians. `on_plate` means the bounding box sits on the bed within
+            0.05 mm.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  objects: { type: array, items: { $ref: "#/components/schemas/ObjectSummary" } }
+                  count:   { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /objects/{id}:
+    delete:
+      tags: [objects]
+      summary: Remove an object
+      operationId: deleteObject
+      parameters:
+        - $ref: "#/components/parameters/ObjectId"
+      responses:
+        "200":
+          description: "`count` is how many objects remain."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: boolean }
+                  id:      { type: integer, format: int64 }
+                  count:   { type: integer }
+        "400": { $ref: "#/components/responses/BadObjectId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownObject" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /objects/{id}/transform:
+    post:
+      tags: [objects]
+      summary: Move, rotate or scale an object
+      operationId: transformObject
+      description: |
+        At least one of translate, rotate or scale. Each must be an array of
+        exactly three numbers or it is treated as absent. Applies to instance 0.
+
+        translate is a relative delta in mm, rotate a relative delta in degrees,
+        and scale an absolute factor that replaces the current one. The echoed
+        rotation is in radians.
+      parameters:
+        - $ref: "#/components/parameters/ObjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                translate: { $ref: "#/components/schemas/Vec3" }
+                rotate:    { $ref: "#/components/schemas/Vec3" }
+                scale:     { $ref: "#/components/schemas/Vec3" }
+              example: { translate: [10, 0, 0], rotate: [0, 0, 45] }
+      responses:
+        "200":
+          description: The object's transform after the change.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:        { type: integer, format: int64 }
+                  transform: { $ref: "#/components/schemas/Transform" }
+        "400":
+          description: |
+            `invalid_json`, `body_must_be_object`, `bad_object_id`, or
+            `no_transform` when none of the three fields was usable.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`unknown_object`, or `no_instance` when the object has no instances."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /objects/{id}/duplicate:
+    post:
+      tags: [objects]
+      summary: Add an instance
+      operationId: duplicateObject
+      description: |
+        Adds an instance offset by 10 mm in X and Y from instance 0, sharing its
+        scale, rotation and mirror, and registers it with the plate it lands on.
+      parameters:
+        - $ref: "#/components/parameters/ObjectId"
+      responses:
+        "200":
+          description: Duplicated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  duplicated: { type: boolean }
+                  id:         { type: integer, format: int64 }
+                  instances:  { type: integer }
+        "400": { $ref: "#/components/responses/BadObjectId" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownObject" }
+        "422":
+          description: "`no_instance` — the object has no instance to copy."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /objects/{id}/config:
+    put:
+      tags: [objects]
+      summary: Per-object settings (atomic)
+      operationId: putObjectConfig
+      description: |
+        A flat object of per-object settings, validated and applied atomically in
+        the same way as PUT /config. Keys must exist in the print config
+        definition.
+      parameters:
+        - $ref: "#/components/parameters/ObjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties:
+                oneOf:
+                  - { type: string }
+                  - { type: boolean }
+                  - { type: number }
+              example: { wall_loops: 4 }
+      responses:
+        "200":
+          description: Every key applied.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ConfigWriteResult"
+                  - type: object
+                    properties:
+                      object: { type: string, description: The object's name. }
+        "400":
+          description: "`invalid_json`, `body_must_be_object` or `bad_object_id`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownObject" }
+        "422":
+          description: Validation failed; nothing was applied. `object` is absent on this path.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigWriteResult" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /objects/{id}/layer_height:
+    put:
+      tags: [objects]
+      summary: Adaptive layer height, or reset
+      operationId: putLayerHeight
+      parameters:
+        - $ref: "#/components/parameters/ObjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode:    { type: string, enum: [adaptive, reset] }
+                quality: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+      responses:
+        "200":
+          description: |
+            For mode=reset only `id` and `mode` are returned. For mode=adaptive
+            the response also carries `quality`, `points`, `layer_height_min` and
+            `layer_height_max`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:               { type: integer, format: int64 }
+                  mode:             { type: string, enum: [adaptive, reset] }
+                  quality:          { type: number }
+                  points:           { type: integer }
+                  layer_height_min: { type: number }
+                  layer_height_max: { type: number }
+        "400":
+          description: |
+            `invalid_json`, `bad_object_id`, `missing_mode`, `unknown_mode` or
+            `quality_out_of_range`.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownObject" }
+        "422":
+          description: "`profile_failed` — the adaptive profile could not be computed."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /objects/{id}/height_range:
+    put:
+      tags: [objects]
+      summary: Per-height-range layer height
+      operationId: putHeightRange
+      description: |
+        Either set a range (min_z, max_z, layer_height) or clear them all
+        (clear: true). max_z must exceed min_z, min_z must be at least 0, and
+        layer_height must fall within the printer preset's limits. A range
+        exactly equal to an existing one updates it rather than colliding.
+      parameters:
+        - $ref: "#/components/parameters/ObjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [min_z, max_z, layer_height]
+                  properties:
+                    min_z:        { type: number, minimum: 0 }
+                    max_z:        { type: number }
+                    layer_height: { type: number }
+                - type: object
+                  required: [clear]
+                  properties:
+                    clear: { type: boolean, enum: [true] }
+      responses:
+        "200":
+          description: The full list of ranges after the change.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:            { type: integer, format: int64 }
+                  height_ranges: { type: array, items: { $ref: "#/components/schemas/HeightRange" } }
+        "400":
+          description: |
+            `invalid_json`, `body_must_be_object`, `bad_object_id`,
+            `missing_fields` or `bad_range`.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownObject" }
+        "422":
+          description: |
+            `layer_height_out_of_range`, which carries `min` and `max` rather
+            than a `detail`; or `overlaps_existing`, which carries `existing` as
+            a two-element array.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:    { type: string, enum: [layer_height_out_of_range, overlaps_existing] }
+                  min:      { type: number }
+                  max:      { type: number }
+                  existing:
+                    type: array
+                    items: { type: number }
+                    minItems: 2
+                    maxItems: 2
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /arrange:
+    post:
+      tags: [jobs]
+      summary: Arrange the plate
+      operationId: arrangePlate
+      description: Progress is shown in the slicer's own UI; poll /jobs/status for completion.
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/JobRunning" }
+        "422": { $ref: "#/components/responses/PlateEmpty" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /orient:
+    post:
+      tags: [jobs]
+      summary: Auto-orient objects
+      operationId: orientObjects
+      description: Progress is shown in the slicer's own UI; poll /jobs/status for completion.
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/JobRunning" }
+        "422": { $ref: "#/components/responses/PlateEmpty" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /jobs/status:
+    get:
+      tags: [jobs]
+      summary: Whether arrange/orient is idle
+      operationId: getJobsStatus
+      description: Covers the UI job worker (arrange and orient), not the slicing process.
+      responses:
+        "200":
+          description: Job worker state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [idle]
+                properties:
+                  idle: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /plate/render:
+    get:
+      tags: [render]
+      summary: PNG of the plate or the toolpaths
+      operationId: renderPlate
+      description: |
+        Returns image/png, not JSON. Errors are still JSON. Allows 30 seconds.
+      parameters:
+        - name: view
+          in: query
+          schema: { type: string, enum: [editor, preview], default: editor }
+        - name: angle
+          in: query
+          schema: { type: string, enum: [iso, top, front, left, right, rear, bottom], default: iso }
+        - name: frame
+          in: query
+          description: Defaults to plate for view=editor and object for view=preview.
+          schema: { type: string, enum: [plate, object] }
+        - name: width
+          in: query
+          schema: { type: integer, minimum: 64, maximum: 2048, default: 800 }
+        - name: height
+          in: query
+          schema: { type: integer, minimum: 64, maximum: 2048, default: 600 }
+      responses:
+        "200":
+          description: The rendered image.
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "400":
+          description: |
+            `bad_param`, naming the offending `param`. Most carry an `allowed`
+            array; the width/height case does not.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:   { type: string, enum: [bad_param] }
+                  param:   { type: string }
+                  allowed: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`no_slice_result` — view=preview without a valid slice."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500":
+          description: |
+            `render_failed`, carrying a `reason` such as "no preview canvas",
+            "gcode preview render unavailable", "editor plate render failed" or
+            "png encode failed". Also the generic `internal`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:  { type: string }
+                  reason: { type: string }
+                  detail: { type: string }
+
+  /gcode:
+    get:
+      tags: [slice]
+      summary: Raw G-code of the last successful slice
+      operationId: getGcode
+      description: Returns text/plain, not JSON. Errors are still JSON.
+      responses:
+        "200":
+          description: The G-code file's contents.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`not_sliced` — no valid slice result on the plate."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500":
+          description: "`gcode_file_missing`, plus the generic `internal`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
   /events:
     get:
-      summary: WebSocket event stream (upgrade)
+      tags: [events]
+      summary: WebSocket event stream
       operationId: events
       description: |
-        **This is a WebSocket endpoint, not a normal GET.** Open a WebSocket to
-        `ws://{host}:{port}/api/v1/events?token=<token>`. A bad/missing token
-        closes the connection immediately. Inbound messages are ignored.
+        Not a plain HTTP endpoint: connect with a WebSocket upgrade to
+        `ws://{host}:{port}/api/v1/events?token=<token>`. The token travels as a
+        query parameter because browser WebSocket clients cannot set headers.
 
-        Each message is a JSON object with an `event` field. See the
-        `Event` schema for the payload shapes:
-        `slice.started`, `slice.progress`, `slice.done`, `slice.error`,
-        `slice.cancelled`, `config.changed`, `project.opened`.
+        Server to client only; inbound frames are read and discarded. Each frame
+        is one JSON object whose discriminator is `event`, not `type`.
 
-        Note: `slice.*` event payloads carry `stats` (on done) but NOT the slice
-        `warnings` array — fetch `GET /slice/status` for warnings.
-      security: []
-      parameters:
-        - name: token
-          in: query
-          required: true
-          schema: { type: string }
+        Event values: `project.opened` (carries `project`), `config.changed`
+        (carries `tabs`, the coalesced set of print, filament, printer,
+        sla_print, sla_material and other, debounced by one event-loop turn), and
+        the slice snapshots `slice.started`, `slice.progress`, `slice.done`,
+        `slice.error` and `slice.cancelled`.
+
+        A slice snapshot carries `event`, `state`, `percent`, `message` and, when
+        a slice succeeded, `stats`. It does not carry `warnings`; read those from
+        GET /slice/status.
+
+        An upgrade without a valid token falls through to the HTTP path and is
+        rejected there with 401.
       responses:
-        "101": { description: Switching Protocols (WebSocket handshake accepted). }
+        "200":
+          description: |
+            Not returned in practice. A successful handshake answers 101 and the
+            connection becomes a WebSocket; this entry exists because the OpenAPI
+            tooling requires a 2XX response and cannot describe an upgrade.
+        "101":
+          description: Switching protocols; the WebSocket is open.
         "401": { $ref: "#/components/responses/Unauthorized" }
+
 components:
   securitySchemes:
     ApiToken:
       type: apiKey
       in: header
       name: X-Api-Token
+      description: |
+        32 hex characters from OpenSSL's CSPRNG, generated on first use and shown
+        in Preferences. A bare value, not a Bearer scheme. Compared in constant
+        time. The WebSocket takes the same token as a `?token=` query parameter
+        instead.
+
+  parameters:
+    ObjectId:
+      name: id
+      in: path
+      required: true
+      description: The object's stable id, as reported by GET /objects.
+      schema: { type: integer, format: int64 }
+
   responses:
     Unauthorized:
-      description: Missing or invalid token.
+      description: |
+        Missing or wrong token. The two are deliberately indistinguishable. No
+        route is exempt, so an unknown path without a valid token lands here
+        rather than on 404.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
-          example: { error: "unauthorized" }
+          example: { error: unauthorized }
+    BadRequest:
+      description: "`invalid_json` for a malformed body, or `body_must_be_object`."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadObjectId:
+      description: "`bad_object_id` — the path segment is not an unsigned integer."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: bad_object_id }
+    UnknownObject:
+      description: "`unknown_object` — no object carries that id."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: unknown_object }
     UiTimeout:
-      description: The GUI thread did not respond within 10s.
+      description: |
+        The GUI thread did not run the task within its budget (10s by default,
+        120s for POST /model, 30s for GET /plate/render). The task is cancelled
+        before it runs, so it does not apply its effects afterwards.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
-          example: { error: "ui_timeout" }
+          example: { error: ui_timeout }
+    Internal:
+      description: An unhandled failure. `detail` carries the exception text.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: internal, detail: "..." }
+    JobStarted:
+      description: The job was queued on the UI job worker.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              started: { type: boolean, enum: [true] }
+    JobRunning:
+      description: "`job_running` — the UI job worker is busy."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: job_running }
+    PlateEmpty:
+      description: "`empty` — the plate holds no objects."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: empty }
+
   schemas:
     Error:
       type: object
-      properties:
-        error: { type: string }
-        detail: { type: string, description: "Present on 500 responses." }
       required: [error]
+      properties:
+        error:  { type: string }
+        detail: { type: string }
+
     Vec3:
       type: array
       items: { type: number }
       minItems: 3
       maxItems: 3
+
+    Transform:
+      type: object
+      description: Instance 0 only. `rotation` is in radians.
+      properties:
+        offset:   { $ref: "#/components/schemas/Vec3" }
+        rotation: { $ref: "#/components/schemas/Vec3" }
+        scale:    { $ref: "#/components/schemas/Vec3" }
+
+    ConfigWriteResult:
+      type: object
+      required: [applied, errors]
+      properties:
+        applied:
+          type: array
+          items: { type: string }
+          description: Empty when the batch was rejected.
+        errors:
+          type: object
+          additionalProperties: { type: string }
+          description: Key to reason. Empty on success.
+
+    PresetRef:
+      type: object
+      required: [type, name]
+      properties:
+        type: { type: string, enum: [print, filament, printer] }
+        name: { type: string }
+
+    PresetListItem:
+      type: object
+      properties:
+        name:     { type: string }
+        system:   { type: boolean }
+        visible:  { type: boolean }
+        selected: { type: boolean }
+
+    HeightRange:
+      type: object
+      properties:
+        min_z:        { type: number }
+        max_z:        { type: number }
+        layer_height: { type: number, description: 0.0 when the range carries no explicit height. }
+
+    ObjectSummary:
+      type: object
+      properties:
+        id:                   { type: integer, format: int64, description: The id the object sub-routes take. }
+        index:                { type: integer }
+        name:                 { type: string }
+        size_mm:              { $ref: "#/components/schemas/Vec3" }
+        instances:            { type: integer }
+        transform:            { $ref: "#/components/schemas/Transform" }
+        bbox_min:             { $ref: "#/components/schemas/Vec3" }
+        bbox_max:             { $ref: "#/components/schemas/Vec3" }
+        on_plate:             { type: boolean, description: The bounding box sits on the bed within 0.05 mm. }
+        config:
+          type: object
+          additionalProperties: { type: string }
+        custom_layer_profile: { type: boolean }
+        height_ranges:        { type: array, items: { $ref: "#/components/schemas/HeightRange" } }
+
     Status:
       type: object
       properties:
-        app: { type: string, example: OrcaSlicer }
-        app_version: { type: string, example: "2.3.2" }
-        api_version: { type: string, example: "1.0" }
+        app:         { type: string }
+        app_version: { type: string, description: "The bare upstream version, not the fork's display version." }
+        api_version: { type: string }
         capabilities:
           type: array
           items: { type: string }
-          example: [status, config, slice, events]
-        project: { type: string, description: "Current project filename (may be empty)." }
+        project:     { type: string }
         objects:
           type: array
           items:
             type: object
             properties:
-              name: { type: string }
+              name:    { type: string }
               size_mm: { $ref: "#/components/schemas/Vec3" }
         presets:
           type: object
           properties:
-            printer: { type: string }
-            print: { type: string }
+            printer:   { type: string }
+            print:     { type: string }
             filaments: { type: array, items: { type: string } }
         modified:
           type: object
-          description: Dirty (unsaved) option keys per preset category.
+          description: The dirty keys of each edited preset.
           properties:
-            print: { type: array, items: { type: string } }
+            print:    { type: array, items: { type: string } }
             filament: { type: array, items: { type: string } }
-            printer: { type: array, items: { type: string } }
+            printer:  { type: array, items: { type: string } }
         slice_result_valid: { type: boolean }
-        slicing: { type: boolean, description: "True while a slice is in progress." }
-    ConfigApplyResult:
-      type: object
-      properties:
-        applied: { type: array, items: { type: string } }
-        errors:
-          type: object
-          additionalProperties: { type: string }
-          description: "key -> reason (e.g. unknown_key, or a validation message)."
-      required: [applied, errors]
-    SliceStats:
-      type: object
-      properties:
-        estimated_time: { type: string, example: "27m 23s" }
-        estimated_time_seconds: { type: number, example: 1643 }
-        filament_used_mm: { type: number, example: 1582 }
-        filament_used_g: { type: number, example: 4.72 }
-        total_cost: { type: number, example: 0.094 }
+        slicing:            { type: boolean }
+
     SliceWarning:
       type: object
       properties:
-        level: { type: integer }
+        level:   { type: integer }
         message: { type: string }
-        code: { type: string, example: "1000C001" }
+        code:    { type: string, description: "e.g. TOOLPATH_OUTSIDE for the synthetic plate-boundary warning." }
+
+    RoleBreakdown:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [outer_wall, inner_wall, sparse_infill, internal_solid_infill, top_surface,
+                 gap_infill, bridge, overhang_perimeter, bottom_surface, ironing,
+                 internal_bridge, skirt, brim, support, support_interface,
+                 support_transition, wipe_tower, custom, mixed]
+        time_s:   { type: number }
+        time_pct: { type: number }
+        flow_mm3_s:
+          type: object
+          properties:
+            max:  { type: number }
+            mean: { type: number }
+        filament_mm: { type: number, description: Present only when the role consumed filament. }
+        filament_g:  { type: number, description: Present only when the role consumed filament. }
+
+    Breakdown:
+      type: object
+      properties:
+        mode:         { type: string }
+        total_time_s: { type: number }
+        roles:        { type: array, items: { $ref: "#/components/schemas/RoleBreakdown" } }
+        metrics:      { type: object }
+        layers:       { type: array, items: { type: object } }
+
+    SliceStats:
+      type: object
+      properties:
+        estimated_time:         { type: string }
+        filament_used_mm:       { type: number }
+        filament_used_g:        { type: number }
+        total_cost:             { type: number }
+        estimated_time_seconds: { type: number }
+        breakdown:              { $ref: "#/components/schemas/Breakdown" }
+
     SliceStatus:
       type: object
-      properties:
-        state: { type: string, enum: [idle, slicing, done, error] }
-        percent: { type: integer, description: "-1 when not slicing." }
-        message: { type: string }
-        stats: { $ref: "#/components/schemas/SliceStats" }
-        warnings:
-          type: array
-          items: { $ref: "#/components/schemas/SliceWarning" }
       required: [state, percent, message, warnings]
-    Event:
-      type: object
-      description: |
-        A WebSocket message. `event` discriminates the shape.
       properties:
-        event:
-          type: string
-          enum: [slice.started, slice.progress, slice.done, slice.error, slice.cancelled, config.changed, project.opened]
-        state: { type: string, description: "slice.* events: idle|slicing|done|error." }
-        percent: { type: integer, description: "slice.* events." }
-        message: { type: string, description: "slice.* events." }
-        stats: { $ref: "#/components/schemas/SliceStats" }
-        tabs:
-          type: array
-          description: "config.changed: which preset categories changed."
-          items: { type: string, enum: [print, filament, printer, sla_print, sla_material, other] }
-        project: { type: string, description: "project.opened: the opened project filename." }
-      required: [event]
+        state:    { type: string, enum: [idle, slicing, done, error] }
+        percent:  { type: integer, description: -1 when no slice is in progress. }
+        message:  { type: string }
+        warnings: { type: array, items: { $ref: "#/components/schemas/SliceWarning" } }
+        stats:    { $ref: "#/components/schemas/SliceStats" }
+        breakdown:
+          allOf:
+            - $ref: "#/components/schemas/Breakdown"
+          description: Mirrored at the top level as well as inside stats.

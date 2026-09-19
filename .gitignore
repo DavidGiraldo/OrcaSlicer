@@ -53,3 +53,7 @@ __pycache__/
 *.pyc
 *.opc
 docs/superpowers/
+# orca-mcp: local a esta maquina, no del proyecto.
+/command
+/.agents/
+/.codex/

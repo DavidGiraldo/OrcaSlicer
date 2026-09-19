@@ -7,10 +7,13 @@
 >
 > The API is **off by default** and binds to localhost only; enable it under
 > *Preferences -> Remote API*. See [docs/remote-api/](docs/remote-api/) for the route
-> reference and OpenAPI spec.
+> reference and OpenAPI spec, and [docs/HLSD/remote-api.md](docs/HLSD/remote-api.md) for
+> the design.
 >
 > Upstream feature work belongs on [OrcaSlicer/OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer);
 > the Remote API itself is developed with [MaxEllis/OrcaSlicer](https://github.com/MaxEllis/OrcaSlicer).
+> [docs/fork/SYNC-LOG.md](docs/fork/SYNC-LOG.md) records what this fork has taken from each and
+> why, and [docs/fork/AGENTS.md](docs/fork/AGENTS.md) holds the conventions that keep it current.
 > Everything below this note is the upstream OrcaSlicer README.
 
 <div align="center">

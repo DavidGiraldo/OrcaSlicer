@@ -19,6 +19,7 @@ struct SliceState
     std::string    message;           // progress text or error message
     nlohmann::json stats;             // filled on success (Task 10)
     nlohmann::json warnings = nlohmann::json::array();
+    int            plate { -1 };      // index of the plate the slice ran on; -1 before any slice
 };
 
 class Controller
@@ -53,7 +54,7 @@ private:
     Response handle_status();
     Response handle_get_config(const std::string &target);
     Response handle_put_config(const std::string &body);
-    Response handle_slice();
+    Response handle_slice(const std::string &target);   // ?plate=N
     Response handle_slice_status();
     Response handle_slice_cancel();   // F2: POST /slice/cancel - unwedge/abort
     Response handle_load_model(const std::string &body);   // M4a: POST /model
@@ -64,16 +65,26 @@ private:
     Response handle_delete_preset(const std::string &body);      // DELETE /preset
     Response handle_put_layer_height(uint64_t id, const std::string &body);  // M4c: PUT /objects/{id}/layer_height
     Response handle_put_height_range(uint64_t id, const std::string &body);  // M4c: PUT /objects/{id}/height_range
-    Response handle_get_gcode();                            // M4a: GET /gcode (raw body)
+    Response handle_get_gcode(const std::string &target);   // M4a: GET /gcode (raw body), ?plate=N
     Response handle_plate_render(const std::string &target); // GET /plate/render (PNG: editor|preview)
     Response handle_get_objects();                          // M4b: GET /objects
     Response handle_delete_object(uint64_t id);             // M4b: DELETE /objects/{id}
     Response handle_transform_object(uint64_t id, const std::string &body); // M4b: POST /objects/{id}/transform
     Response handle_duplicate_object(uint64_t id);          // M4b: POST /objects/{id}/duplicate
     Response handle_put_object_config(uint64_t id, const std::string &body); // M4c: PUT /objects/{id}/config
-    Response handle_arrange();                              // M4b: POST /arrange (async)
-    Response handle_orient();                               // M4b: POST /orient (async)
+    Response handle_arrange(const std::string &target);     // M4b: POST /arrange (async), ?plate=N
+    Response handle_orient(const std::string &target);      // M4b: POST /orient (async), ?plate=N
     Response handle_jobs_status();                          // M4b: GET /jobs/status
+    Response handle_get_plates();                           // GET /plates
+    Response handle_get_plate(int index);                   // GET /plates/{i}
+    Response handle_add_plate(const std::string &body);     // POST /plates
+    Response handle_duplicate_plate(int index);             // POST /plates/{i}/duplicate
+    Response handle_delete_plate(int index, bool force);    // DELETE /plates/{i}
+    Response handle_select_plate(int index);                // POST /plates/{i}/select
+    Response handle_put_plate(int index, const std::string &body); // PUT /plates/{i}
+    Response handle_project_save(const std::string &body);  // POST /project/save
+    Response handle_project_open(const std::string &body);  // POST /project/open
+    Response handle_project_new(const std::string &body);   // POST /project/new
 
     // Mutate m_slice under the lock and broadcast a snapshot (event_name) to WS clients.
     void set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name);

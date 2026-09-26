@@ -44,14 +44,14 @@ WebSocket handshake. It takes the same token as a query parameter instead.
 
 ## Endpoints
 
-24 HTTP operations and one WebSocket.
+34 HTTP operations and one WebSocket.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/status` | Application, project, presets, capabilities |
 | GET | `/config` | Read configuration values |
 | PUT | `/config` | Write configuration values, atomically |
-| POST | `/slice` | Start slicing the current plate |
+| POST | `/slice` | Start slicing the current plate, or `?plate=N` |
 | GET | `/slice/status` | Slice state, progress, statistics, warnings |
 | POST | `/slice/cancel` | Cancel a running slice |
 | POST | `/model` | Load a model file from the host filesystem |
@@ -60,19 +60,39 @@ WebSocket handshake. It takes the same token as a query parameter instead.
 | POST | `/preset/save` | Save the edited preset under a name |
 | POST | `/preset/config` | Read a named preset's configuration |
 | DELETE | `/preset` | Delete a user preset |
-| GET | `/objects` | List objects on the plate |
+| GET | `/objects` | List objects, with the plate each instance is on |
 | DELETE | `/objects/{id}` | Remove an object |
-| POST | `/objects/{id}/transform` | Move, rotate or scale an object |
+| POST | `/objects/{id}/transform` | Move, rotate or scale an instance, or move it to a plate |
 | POST | `/objects/{id}/duplicate` | Add an instance |
 | PUT | `/objects/{id}/config` | Per-object settings, atomically |
 | PUT | `/objects/{id}/layer_height` | Adaptive layer height, or reset |
 | PUT | `/objects/{id}/height_range` | Per-height-range layer height |
-| POST | `/arrange` | Arrange the plate |
-| POST | `/orient` | Auto-orient objects |
+| POST | `/arrange` | Arrange all plates, or `?plate=N` |
+| POST | `/orient` | Auto-orient objects, or those on `?plate=N` |
 | GET | `/jobs/status` | Whether arrange/orient is idle |
-| GET | `/plate/render` | PNG of the plate or the toolpaths |
-| GET | `/gcode` | Raw G-code of the last successful slice |
+| GET | `/plate/render` | PNG of the plate or the toolpaths, or `?plate=N` |
+| GET | `/gcode` | Raw G-code of the current plate's slice, or `?plate=N` |
+| GET | `/plates` | List plates |
+| GET | `/plates/{i}` | One plate |
+| POST | `/plates` | Add a plate |
+| POST | `/plates/{i}/duplicate` | Duplicate a plate and its objects |
+| POST | `/plates/{i}/select` | Make a plate the current one |
+| PUT | `/plates/{i}` | Rename, lock, and per-plate settings |
+| DELETE | `/plates/{i}` | Delete a plate |
+| POST | `/project/save` | Save the project, or save it as a path |
+| POST | `/project/open` | Open a `.3mf` project |
+| POST | `/project/new` | Start a new, empty project |
 | WS | `/events` | Push notifications |
+
+### Plates
+
+Plates are addressed by index, from 0, in the order the plate list shows them. Routes that act on
+"the current plate" — `/slice`, `/gcode`, `/plate/render`, `/arrange`, `/orient` — also take an
+optional `?plate=N`. Without it they behave as they always have. With it, `/slice`,
+`/plate/render`, `/arrange` and `/orient` first make plate N the current one, exactly as clicking
+its tab would; `/gcode` reads plate N's result without changing the selection, because each plate
+keeps its own. A plate that does not exist is `404 unknown_plate`, and switching plates while a
+slice runs is refused with `409 busy_slicing`.
 
 Two of these take a request body on a method where some HTTP clients disallow one:
 `DELETE /preset` and, by design, `POST /preset/config` — a POST precisely so preset names
@@ -88,8 +108,11 @@ curl -H "X-Api-Token: $T" http://127.0.0.1:13130/api/v1/status
 {
   "app": "OrcaSlicer", "app_version": "2.5.0-dev", "api_version": "1.0",
   "capabilities": ["status","config","slice","events","model","preset","gcode",
-                   "objects","arrange","orient","object_config","slice_breakdown","plate_render"],
+                   "objects","arrange","orient","object_config","slice_breakdown","plate_render",
+                   "plates"],
   "project": "/path/to/project.3mf",
+  "current_plate": 0, "plate_count": 2,
+  "project_dirty": false, "presets_dirty": false,
   "objects": [{"name": "cube", "size_mm": [20.0, 20.0, 20.0]}],
   "presets": {"printer": "…", "print": "…", "filaments": ["…"]},
   "modified": {"print": ["layer_height"], "filament": [], "printer": []},
@@ -179,9 +202,24 @@ the fallback.
 {"started": true}
 ```
 
+`?plate=N` slices plate N; every response carries the `plate` it acted on.
+
 `202` when slicing begins. `200` with `{"started": false, "already_valid": true}` when the plate
-already holds a valid result. `409 already_slicing`, `422 nothing_to_slice`, or
-`422 slice_not_started` when the plate cannot be sliced.
+already holds a valid result. `409 already_slicing`, `409 busy_slicing`, `404 unknown_plate`,
+`422 nothing_to_slice`, or `422 slice_not_started` when the plate cannot be sliced.
+
+`slice_not_started` carries the reason, found the way the Slice button finds it:
+
+```json
+{"error": "slice_not_started", "plate": 1, "reason": "validation",
+ "message": "Lid Clip.stl is too close to others, and collisions may be caused.",
+ "object": "Lid Clip.stl"}
+```
+
+`reason` is `outside` (an object is partly off the plate, too tall, or uses a filament the plate
+cannot print), `validation` (the print's own check failed; `message` is its text, with `opt_key`
+and `object` when it names them) or `invalid_state`. The same `message` becomes the
+`/slice/status` message.
 
 ### GET /slice/status
 
@@ -199,7 +237,8 @@ Reads a snapshot without touching the GUI thread, so it never times out.
 }
 ```
 
-`state` is `idle`, `slicing`, `done` or `error`. `stats` appears only after a successful slice.
+`state` is `idle`, `slicing`, `done` or `error`. `plate` is the plate the slice ran on, `-1`
+before any. `stats` appears only after a successful slice.
 `breakdown` is emitted both inside `stats` and mirrored at the top level.
 
 The breakdown carries `mode`, `total_time_s` and a `roles` array, each entry with `role`,
@@ -325,7 +364,8 @@ Errors: `404 unknown_preset`, `409 builtin_preset`, `409 preset_selected` (selec
 
 `id` is the stable identifier the object sub-routes take. `transform` describes **instance 0**
 only, and its `rotation` is in **radians**. `on_plate` means the bounding box sits on the bed
-within 0.05 mm.
+within 0.05 mm. `plate` is the plate instance 0 is on and `instance_plates` lists it for every
+instance; `-1` means on no plate.
 
 ### DELETE /objects/{id}
 
@@ -334,11 +374,13 @@ Returns `{"deleted": true, "id": 12345, "count": 0}`, where `count` is how many 
 
 ### POST /objects/{id}/transform
 
-At least one of three fields, each a 3-element array:
+At least one of `plate`, `translate`, `rotate` or `scale`:
 
 | Field | Units | Semantics |
 | --- | --- | --- |
-| `translate` | mm | **relative**, added to the current offset |
+| `instance` | index | which instance, from 0; default `0` |
+| `plate` | index | **moves** the instance to that plate, keeping its position relative to the plate; one on no plate is centred on it |
+| `translate` | mm | **relative**, added to the current offset, after any `plate` move |
 | `rotate` | degrees | **relative**, added to the current rotation |
 | `scale` | factor | **absolute**, replaces the current scale |
 
@@ -348,9 +390,12 @@ curl -X POST -H "X-Api-Token: $T" -H "Content-Type: application/json" \
   http://127.0.0.1:13130/api/v1/objects/12345/transform
 ```
 
-Applies to instance 0. The echoed `rotation` is in radians.
+The response echoes `instance`, the `plate` it now sits on (`-1` for none) and its `transform`,
+whose `rotation` is in radians. Moving onto a spiral-vase plate applies that plate's vase-mode object
+settings without the confirmation the GUI would show.
 
-Errors: `400 no_transform`, `404 unknown_object`, `404 no_instance`.
+Errors: `400 no_transform`, `400 bad_param` (`instance` or `plate`), `404 unknown_object`,
+`404 no_instance`, `404 unknown_instance`, `404 unknown_plate`.
 
 ### POST /objects/{id}/duplicate
 
@@ -414,9 +459,14 @@ Errors: `400 missing_fields`, `400 bad_range`, `404 unknown_object`,
 
 ### POST /arrange and POST /orient
 
-No body. `202 {"started": true}`, `422 {"error": "empty"}` when the plate holds no objects, or
-`409 {"error": "job_running"}` when the job worker is busy. Progress is shown in the slicer's own
-UI; poll `/jobs/status` for completion.
+No body. Without `?plate=N`, arrange works on every plate and orient on everything, as the
+toolbar buttons do; with it, only on plate N, as the plate's own menu does. Locked plates are
+skipped by arrange.
+
+`202 {"started": true, "plate": -1}`, `422 {"error": "empty"}` when there are no objects,
+`409 {"error": "job_running"}` when the job worker is busy, `409 plate_locked` for a locked
+`?plate=N`, `409 busy_slicing`, `404 unknown_plate`. Progress is shown in the slicer's own UI; poll
+`/jobs/status` for completion.
 
 ### GET /jobs/status
 
@@ -440,15 +490,120 @@ curl -H "X-Api-Token: $T" \
   -o plate.png
 ```
 
+`?plate=N` makes plate N the current one first, then renders it.
+
 Allows 30 seconds. Errors are JSON: `400 bad_param` (naming the parameter and usually its allowed
-values), `409 no_slice_result` when asking for `preview` without a valid slice, and
-`500 render_failed` with a `reason`.
+values), `404 unknown_plate`, `409 no_slice_result` when asking for `preview` without a valid slice,
+`409 busy_slicing`, and `500 render_failed` with a `reason`.
 
 ### GET /gcode
 
-Returns the raw G-code of the last successful slice as `text/plain`, not JSON.
+Returns the raw G-code of the current plate's slice as `text/plain`, not JSON. `?plate=N` reads
+plate N's slice instead, without changing the current plate.
 
-Errors: `409 not_sliced`, `500 gcode_file_missing`.
+Errors: `404 unknown_plate`, `409 not_sliced`, `500 gcode_file_missing`.
+
+### GET /plates
+
+```json
+{"count": 2, "current": 0,
+ "plates": [{
+   "index": 1, "name": "Clips", "current": false, "locked": false,
+   "empty": false, "printable": true, "slice_result_valid": true,
+   "origin": [264.0, 0.0], "bed": {"min": [264.0, 0.0], "max": [484.0, 220.0]},
+   "bed_type": "default", "effective_bed_type": "High Temp Plate",
+   "print_sequence": "by object", "effective_print_sequence": "by object",
+   "first_layer_sequence": [], "spiral_mode": "default", "effective_spiral_mode": false,
+   "objects": [{"id": 12345, "name": "Lid Clip.stl", "instance": 0}]
+ }]}
+```
+
+`origin` and `bed` are in world coordinates, the ones object offsets and bounding boxes use.
+`bed_type`, `print_sequence` and `spiral_mode` are the plate's own setting, `"default"` meaning it
+follows the global one; the `effective_` fields give the value that applies. Bed types are the
+config names (`"Cool Plate"`, `"Engineering Plate"`, `"High Temp Plate"`, `"Textured PEI Plate"`,
+`"Textured Cool Plate"`, `"Supertack Plate"`). `first_layer_sequence` lists 1-based filament
+numbers; empty means automatic. `objects` lists the instances on the plate.
+
+### GET /plates/{i}
+
+One plate, as above. `400 bad_plate_index`, `404 unknown_plate`.
+
+### POST /plates
+
+Optional body `{"name": "…"}`. Adds a plate after the last one and makes it current, as the toolbar
+button does. `201` with the new plate. `409 busy_slicing`, `422 cannot_add_plate` at the maximum.
+
+### POST /plates/{i}/duplicate
+
+Adds a copy of plate i, with copies of its objects, after the last plate. `201` with the new plate.
+`404 unknown_plate`, `422 cannot_add_plate`.
+
+### POST /plates/{i}/select
+
+Makes plate i current, as clicking its tab does. `200` with the plate. `404 unknown_plate`,
+`409 busy_slicing`.
+
+### PUT /plates/{i}
+
+Any subset of these fields, validated as a whole before anything changes:
+
+| Field | Values |
+| --- | --- |
+| `name` | a string |
+| `locked` | `true` or `false`; a locked plate is skipped by arrange and orient |
+| `bed_type` | a bed type name, or `"default"` |
+| `print_sequence` | `"by layer"`, `"by object"` or `"default"` |
+| `first_layer_sequence` | 1-based filament numbers, or `[]` for automatic |
+| `spiral_mode` | `true`, `false` or `"default"` |
+
+The settings are applied as the Plate Settings dialog applies them. Turning `spiral_mode` on also
+applies the vase-mode object settings the dialog would have asked about. `200` with the plate.
+`404 unknown_plate`, `422 invalid_settings` with an `errors` object keyed by field.
+
+### DELETE /plates/{i}
+
+Deletes plate i. The slicer never deletes objects with their plate: it moves them onto the last
+plate or off every plate. So a plate that still holds objects is refused with
+`409 plate_not_empty` (listing them in `objects`) unless the request adds `?force=true`. Later plates
+shift down by one index.
+
+```json
+{"deleted": 1, "moved_objects": [{"id": 12345, "name": "Lid Clip.stl", "instance": 0}],
+ "count": 1, "current": 0}
+```
+
+`404 unknown_plate`, `409 last_plate`, `409 busy_slicing`.
+
+### POST /project/save
+
+Optional body `{"path": "C:/projects/part.3mf"}`. Without a path, saves the project where it was
+opened or last saved; with one, saves it there and makes that the project's path, as Save As does.
+The path must end in `.3mf` and its folder must exist.
+
+`200 {"saved": "<path>"}`. `409 no_project_path` for a project never saved, `422 bad_path`,
+`500 save_failed`. Allows 120 seconds.
+
+### POST /project/open
+
+```json
+{"path": "C:/projects/part.3mf", "discard": false}
+```
+
+Opens a `.3mf` project as the File menu does, with its plates, objects and presets. When the
+current project or presets have unsaved changes the request is refused with `409 project_dirty`
+(carrying `model_dirty` and `presets_dirty`) rather than prompting; pass `"discard": true` to drop
+them. The slicer's warning about custom G-code in the project's presets is not shown.
+
+`200 {"project": "<path>", "plate_count": 2, "objects": 15}`. `400 missing_path`,
+`404 not_found`, `409 busy_slicing`, `409 project_dirty`, `422 unsupported_format`. Allows 120
+seconds.
+
+### POST /project/new
+
+Optional body `{"discard": false}`. Starts a new, empty project, refusing unsaved changes the same
+way `/project/open` does. `200 {"created": true, "plate_count": 1}`. `409 busy_slicing`,
+`409 project_dirty`.
 
 ### WS /events
 
@@ -462,6 +617,8 @@ discriminator is **`event`**.
 | `event` | Payload |
 | --- | --- |
 | `project.opened` | `project` — the project path |
+| `project.saved` | `project` — the path it was saved to |
+| `project.new` | — |
 | `config.changed` | `tabs` — the coalesced set of `print`, `filament`, `printer`, `sla_print`, `sla_material`, `other` |
 | `slice.started` | snapshot: `state` `slicing`, `percent` 0, `message` `starting` |
 | `slice.progress` | snapshot with the current `percent` and `message` |
@@ -469,8 +626,8 @@ discriminator is **`event`**.
 | `slice.error` | snapshot with `state` `error` and the error in `message` |
 | `slice.cancelled` | snapshot with `state` `idle` and `message` `cancelled` |
 
-A slice snapshot carries `event`, `state`, `percent`, `message` and, when a slice succeeded,
-`stats`. It does not carry `warnings`; read those from `GET /slice/status`.
+A slice snapshot carries `event`, `state`, `percent`, `message`, `plate` and, when a slice
+succeeded, `stats`. It does not carry `warnings`; read those from `GET /slice/status`.
 
 `config.changed` is debounced by one event-loop turn, so a preset switch touching many keys
 produces one event rather than a storm.
@@ -479,8 +636,8 @@ produces one event rather than a storm.
 
 - **Requests are serialized through the GUI thread.** Most handlers allow 10 seconds and return
   `504 {"error": "ui_timeout"}` on expiry. A timed-out request is cancelled before it runs, so it
-  does not apply its effects afterwards. `POST /model` allows 120 seconds and
-  `GET /plate/render` 30.
+  does not apply its effects afterwards. `POST /model`, `/project/save` and `/project/open`
+  allow 120 seconds, `/project/new` 60 and `GET /plate/render` 30.
 - **Request bodies are capped at 4 MiB**, and sockets time out after 15 seconds of inactivity.
   Connections are not kept alive.
 - **Unhandled failures** return `500 {"error": "internal", "detail": "…"}`. A malformed body on a
@@ -488,6 +645,8 @@ produces one event rather than a storm.
   server started but before the controller was attached returns `503 {"error": "no_handler"}`.
 - **Path matching is exact** up to the query string, so `/api/v1/statuses` does not match
   `/api/v1/status`.
-- **Object transforms apply to instance 0.** There is no per-instance addressing.
-- **The API does not save your project.** Mutations live in the running session until something
-  saves them.
+- **Object transforms default to instance 0**; pass `instance` to address another. Duplicate
+  and delete act on whole objects.
+- **The API saves only when asked.** Mutations live in the running session until
+  `POST /project/save` or the user saves them. `project_dirty` in `/status` says whether there is
+  unsaved work.

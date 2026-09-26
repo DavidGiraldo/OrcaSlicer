@@ -9,9 +9,10 @@ drive by hand and impossible to drive by anything else.
 
 The Remote API is an HTTP and WebSocket server embedded in the running application that gives an
 external program the same reach a user has: read and write settings, load models, move and
-duplicate objects, choose presets, start and cancel a slice, render the plate, and fetch the
-resulting G-code. Its intended client is the `orcaslicer-mcp` server, which exposes those
-operations to an AI agent, but nothing in the design is specific to that client.
+duplicate objects, choose presets, manage plates, start and cancel a slice, render a plate, fetch
+the resulting G-code, and save or open the project. Its intended client is the `orcaslicer-mcp`
+server, which exposes those operations to an AI agent, but nothing in the design is specific to
+that client.
 
 Two constraints shape the whole subsystem, and most of what follows is a consequence of one of
 them:
@@ -95,6 +96,47 @@ Some guards exist only because upstream removed its own. The wipe tower position
 example: a render-time clamp was deleted on the grounds that the stored position is already
 clamped by the paths that write it, and the enumeration of those paths did not include this API.
 The clamp now lives here.
+
+## Plates
+
+The slicer has a single notion of "the current plate": the one the canvas shows, the background
+process is pointed at, and the Slice button slices. Routes that predate plate support act on it
+implicitly, and they still do, so existing clients keep working. Every such route also accepts an
+explicit plate, and honours it the way the GUI would: slicing, rendering, arranging or orienting a
+plate first makes it current, exactly as clicking its tab does. Reading a plate's G-code is the one
+exception, because each plate keeps its own slice result and reading it needs no switch.
+
+Switching plates retargets the background process, so it is refused while a slice runs rather
+than leaving the running print attached to a plate that is no longer current. Plate indices are
+the plate list's own, from 0; deleting a plate shifts the ones after it, which is why a delete
+reports the new count and the new current plate.
+
+Plate operations reuse the plater's public functions — the ones the toolbar, the plate menu and
+the Plate Settings dialog call — rather than reimplementing them. Where those paths end in a
+dialog, the API calls what the dialog would have called on confirmation: a rename sets the name
+directly, and enabling spiral mode applies the vase-mode object settings the dialog asks about,
+because a caller that requested spiral mode has already given that answer. The slicer never
+deletes objects with their plate — it moves them onto another plate or off every plate — so
+deleting a plate that still holds objects requires the caller to say so explicitly.
+
+## Projects
+
+Saving, opening and replacing a project are the operations most bound up with modal dialogs: a
+file chooser, a save-failure message box, a prompt about unsaved changes, a choice between opening
+a project and importing its geometry, and a warning about custom G-code in its presets. No API
+client can answer a modal dialog, and one left open blocks the GUI thread until the request times
+out. Each route therefore takes the path the dialog would have produced and calls the code behind
+it: saving writes the 3MF and then does what a successful Save does; opening passes the loader the
+choice the drop dialog would have asked for.
+
+Unsaved changes are refused rather than prompted about, and the caller may ask to discard them.
+Discarding first is what makes the confirmation paths silent, because they only ask when something
+is unsaved. "Unsaved" has two sources — the undo stack, which the close prompt consults, and the
+title bar's dirty flag, which also covers edits that take no snapshot, such as a plate rename — and
+the API counts both, so a rename is never lost silently.
+
+A save pumps the event queue while it writes, exactly like the periodic auto-backup, so it takes
+the same mutual-exclusion gate described below: other API work waits until the file is written.
 
 ## Slice state and events
 

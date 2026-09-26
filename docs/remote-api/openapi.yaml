@@ -22,7 +22,8 @@ info:
 
     **Threading:** the server runs a single I/O thread and dispatches most
     endpoints onto the GUI thread with a 10s timeout (`504 ui_timeout`).
-    `POST /model` allows 120s and `GET /plate/render` 30s. A timed-out request is
+    `POST /model`, `POST /project/save` and `POST /project/open` allow 120s,
+    `POST /project/new` 60s and `GET /plate/render` 30s. A timed-out request is
     cancelled before it runs, so it does not apply its effects afterwards. Treat
     the API as single-client; concurrent heavy calls serialize.
 
@@ -56,6 +57,10 @@ tags:
     description: Arrange and orient, which run on the UI job worker.
   - name: render
     description: Offscreen PNG renders of the plate and the toolpaths.
+  - name: plates
+    description: Listing, selecting, adding, deleting and configuring plates.
+  - name: project
+    description: Saving, opening and starting projects.
   - name: events
     description: The WebSocket push stream.
 
@@ -164,8 +169,10 @@ paths:
   /slice:
     post:
       tags: [slice]
-      summary: Start slicing the current plate
+      summary: Start slicing the current plate, or plate N
       operationId: startSlice
+      parameters:
+        - $ref: "#/components/parameters/PlateQuery"
       responses:
         "200":
           description: The plate already holds a valid slice result; nothing started.
@@ -176,6 +183,7 @@ paths:
                 properties:
                   started: { type: boolean, enum: [false] }
                   already_valid: { type: boolean, enum: [true] }
+                  plate: { type: integer }
         "202":
           description: Slicing started.
           content:
@@ -184,16 +192,24 @@ paths:
                 type: object
                 properties:
                   started: { type: boolean, enum: [true] }
+                  plate: { type: integer }
+        "400": { $ref: "#/components/responses/BadPlateParam" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
         "409":
-          description: A slice is already running (`already_slicing`).
+          description: "`already_slicing`, or `busy_slicing` when switching to plate N."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "422":
           description: |
             `nothing_to_slice` when the model holds no objects, or
-            `slice_not_started` when the plate cannot be sliced (object outside
-            the bed, or a latched invalid state).
-          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+            `slice_not_started` when the plate cannot be sliced. The latter
+            carries why, found the way the Slice button finds it.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/SliceNotStarted"
         "504": { $ref: "#/components/responses/UiTimeout" }
         "500": { $ref: "#/components/responses/Internal" }
 
@@ -519,15 +535,17 @@ paths:
   /objects/{id}/transform:
     post:
       tags: [objects]
-      summary: Move, rotate or scale an object
+      summary: Move, rotate or scale an instance, or move it to a plate
       operationId: transformObject
       description: |
-        At least one of translate, rotate or scale. Each must be an array of
-        exactly three numbers or it is treated as absent. Applies to instance 0.
+        At least one of plate, translate, rotate or scale. The vectors must be
+        arrays of exactly three numbers or they are treated as absent. Applies to
+        `instance`, default 0.
 
-        translate is a relative delta in mm, rotate a relative delta in degrees,
-        and scale an absolute factor that replaces the current one. The echoed
-        rotation is in radians.
+        plate moves the instance to that plate, keeping its position relative to
+        the plate (one on no plate is centred on it). translate is then a relative
+        delta in mm, rotate a relative delta in degrees, and scale an absolute
+        factor that replaces the current one. The echoed rotation is in radians.
       parameters:
         - $ref: "#/components/parameters/ObjectId"
       requestBody:
@@ -538,6 +556,8 @@ paths:
               type: object
               minProperties: 1
               properties:
+                instance:  { type: integer, minimum: 0, default: 0 }
+                plate:     { type: integer, minimum: 0, description: Target plate index. }
                 translate: { $ref: "#/components/schemas/Vec3" }
                 rotate:    { $ref: "#/components/schemas/Vec3" }
                 scale:     { $ref: "#/components/schemas/Vec3" }
@@ -551,15 +571,17 @@ paths:
                 type: object
                 properties:
                   id:        { type: integer, format: int64 }
+                  instance:  { type: integer }
+                  plate:     { type: integer, description: -1 when on no plate. }
                   transform: { $ref: "#/components/schemas/Transform" }
         "400":
           description: |
-            `invalid_json`, `body_must_be_object`, `bad_object_id`, or
-            `no_transform` when none of the three fields was usable.
+            `invalid_json`, `body_must_be_object`, `bad_object_id`, `bad_param`
+            (instance or plate), or `no_transform` when no field was usable.
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
-          description: "`unknown_object`, or `no_instance` when the object has no instances."
+          description: "`unknown_object`, `no_instance`, `unknown_instance` or `unknown_plate`."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "504": { $ref: "#/components/responses/UiTimeout" }
         "500": { $ref: "#/components/responses/Internal" }
@@ -759,11 +781,20 @@ paths:
       tags: [jobs]
       summary: Arrange the plate
       operationId: arrangePlate
-      description: Progress is shown in the slicer's own UI; poll /jobs/status for completion.
+      description: |
+        Progress is shown in the slicer's own UI; poll /jobs/status for completion.
+        Without `plate`, acts on everything as the toolbar button does; with it,
+        only on that plate, as the plate's own menu does. Arrange skips locked plates.
+      parameters:
+        - $ref: "#/components/parameters/PlateQuery"
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadPlateParam" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "409": { $ref: "#/components/responses/JobRunning" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
+        "409":
+          description: "`job_running`, `plate_locked` or `busy_slicing`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "422": { $ref: "#/components/responses/PlateEmpty" }
         "504": { $ref: "#/components/responses/UiTimeout" }
         "500": { $ref: "#/components/responses/Internal" }
@@ -773,11 +804,20 @@ paths:
       tags: [jobs]
       summary: Auto-orient objects
       operationId: orientObjects
-      description: Progress is shown in the slicer's own UI; poll /jobs/status for completion.
+      description: |
+        Progress is shown in the slicer's own UI; poll /jobs/status for completion.
+        Without `plate`, acts on everything as the toolbar button does; with it,
+        only on that plate, as the plate's own menu does. Arrange skips locked plates.
+      parameters:
+        - $ref: "#/components/parameters/PlateQuery"
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadPlateParam" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "409": { $ref: "#/components/responses/JobRunning" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
+        "409":
+          description: "`job_running`, `plate_locked` or `busy_slicing`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "422": { $ref: "#/components/responses/PlateEmpty" }
         "504": { $ref: "#/components/responses/UiTimeout" }
         "500": { $ref: "#/components/responses/Internal" }
@@ -809,7 +849,9 @@ paths:
       operationId: renderPlate
       description: |
         Returns image/png, not JSON. Errors are still JSON. Allows 30 seconds.
+        `plate` makes that plate the current one first.
       parameters:
+        - $ref: "#/components/parameters/PlateQuery"
         - name: view
           in: query
           schema: { type: string, enum: [editor, preview], default: editor }
@@ -866,9 +908,13 @@ paths:
   /gcode:
     get:
       tags: [slice]
-      summary: Raw G-code of the last successful slice
+      summary: Raw G-code of the current plate's slice, or plate N's
       operationId: getGcode
-      description: Returns text/plain, not JSON. Errors are still JSON.
+      description: |
+        Returns text/plain, not JSON. Errors are still JSON. With `plate`, reads
+        that plate's slice without changing the current plate.
+      parameters:
+        - $ref: "#/components/parameters/PlateQuery"
       responses:
         "200":
           description: The G-code file's contents.
@@ -876,6 +922,8 @@ paths:
             text/plain:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { $ref: "#/components/responses/BadPlateParam" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
         "409":
           description: "`not_sliced` — no valid slice result on the plate."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -883,6 +931,277 @@ paths:
         "500":
           description: "`gcode_file_missing`, plus the generic `internal`."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /plates:
+    get:
+      tags: [plates]
+      summary: List plates
+      operationId: listPlates
+      responses:
+        "200":
+          description: Every plate, in index order.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:   { type: integer }
+                  current: { type: integer }
+                  plates:  { type: array, items: { $ref: "#/components/schemas/Plate" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+    post:
+      tags: [plates]
+      summary: Add a plate
+      operationId: addPlate
+      description: Adds a plate after the last one and makes it current, as the toolbar button does.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/PlateResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`busy_slicing`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "422":
+          description: "`cannot_add_plate` — the maximum number of plates is reached."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /plates/{index}:
+    parameters:
+      - $ref: "#/components/parameters/PlateIndex"
+    get:
+      tags: [plates]
+      summary: One plate
+      operationId: getPlate
+      responses:
+        "200": { $ref: "#/components/responses/PlateResult" }
+        "400": { $ref: "#/components/responses/BadPlateIndex" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+    put:
+      tags: [plates]
+      summary: Rename, lock and configure a plate
+      operationId: updatePlate
+      description: |
+        Any subset of the fields, validated as a whole before anything changes.
+        Settings are applied as the Plate Settings dialog applies them; turning
+        spiral_mode on also applies the vase-mode object settings the dialog would
+        have asked about.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlateUpdate" }
+      responses:
+        "200": { $ref: "#/components/responses/PlateResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
+        "422":
+          description: "`invalid_settings`, with an `errors` object keyed by field."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:  { type: string, enum: [invalid_settings] }
+                  errors: { type: object, additionalProperties: { type: string } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      tags: [plates]
+      summary: Delete a plate
+      operationId: deletePlate
+      description: |
+        The slicer moves a deleted plate's objects onto the last plate or off every
+        plate; it never deletes them. A plate that still holds objects is refused
+        unless `force=true`. Later plates shift down by one index.
+      parameters:
+        - name: force
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:       { type: integer }
+                  moved_objects: { type: array, items: { $ref: "#/components/schemas/PlateObject" } }
+                  count:         { type: integer }
+                  current:       { type: integer }
+        "400": { $ref: "#/components/responses/BadPlateIndex" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
+        "409":
+          description: |
+            `last_plate`, `busy_slicing`, or `plate_not_empty` (listing the
+            instances in `objects`) without force.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /plates/{index}/select:
+    parameters:
+      - $ref: "#/components/parameters/PlateIndex"
+    post:
+      tags: [plates]
+      summary: Make a plate the current one
+      operationId: selectPlate
+      responses:
+        "200": { $ref: "#/components/responses/PlateResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
+        "409":
+          description: "`busy_slicing`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /plates/{index}/duplicate:
+    parameters:
+      - $ref: "#/components/parameters/PlateIndex"
+    post:
+      tags: [plates]
+      summary: Duplicate a plate and its objects
+      operationId: duplicatePlate
+      responses:
+        "201": { $ref: "#/components/responses/PlateResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/UnknownPlate" }
+        "422":
+          description: "`cannot_add_plate`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /project/save:
+    post:
+      tags: [project]
+      summary: Save the project, or save it as a path
+      operationId: saveProject
+      description: |
+        Without a path, saves where the project was opened or last saved; with
+        one, saves there and makes it the project's path, as Save As does. The
+        path must end in .3mf and its folder must exist. Allows 120 seconds.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path: { type: string }
+      responses:
+        "200":
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`no_project_path` — the project was never saved and no path was given."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "422":
+          description: "`bad_path`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500":
+          description: "`save_failed`, plus the generic `internal`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /project/open:
+    post:
+      tags: [project]
+      summary: Open a .3mf project
+      operationId: openProject
+      description: |
+        Opens a project as the File menu does. Unsaved changes are refused with
+        409 project_dirty rather than prompted about; pass discard to drop them.
+        The warning about custom G-code in the project's presets is not shown.
+        Allows 120 seconds.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:    { type: string }
+                discard: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Opened.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project:     { type: string }
+                  plate_count: { type: integer }
+                  objects:     { type: integer }
+        "400":
+          description: "`invalid_json`, `body_must_be_object` or `missing_path`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`not_found`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409": { $ref: "#/components/responses/ProjectBlocked" }
+        "422":
+          description: "`unsupported_format` — only .3mf projects."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /project/new:
+    post:
+      tags: [project]
+      summary: Start a new, empty project
+      operationId: newProject
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                discard: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created:     { type: boolean, enum: [true] }
+                  plate_count: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ProjectBlocked" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+        "500": { $ref: "#/components/responses/Internal" }
 
   /events:
     get:
@@ -897,14 +1216,15 @@ paths:
         Server to client only; inbound frames are read and discarded. Each frame
         is one JSON object whose discriminator is `event`, not `type`.
 
-        Event values: `project.opened` (carries `project`), `config.changed`
+        Event values: `project.opened` and `project.saved` (carry `project`),
+        `project.new`, `config.changed`
         (carries `tabs`, the coalesced set of print, filament, printer,
         sla_print, sla_material and other, debounced by one event-loop turn), and
         the slice snapshots `slice.started`, `slice.progress`, `slice.done`,
         `slice.error` and `slice.cancelled`.
 
-        A slice snapshot carries `event`, `state`, `percent`, `message` and, when
-        a slice succeeded, `stats`. It does not carry `warnings`; read those from
+        A slice snapshot carries `event`, `state`, `percent`, `message`, `plate`
+        and, when a slice succeeded, `stats`. It does not carry `warnings`; read those from
         GET /slice/status.
 
         An upgrade without a valid token falls through to the HTTP path and is
@@ -938,6 +1258,18 @@ components:
       required: true
       description: The object's stable id, as reported by GET /objects.
       schema: { type: integer, format: int64 }
+    PlateIndex:
+      name: index
+      in: path
+      required: true
+      description: The plate's index, from 0, as reported by GET /plates.
+      schema: { type: integer, minimum: 0 }
+    PlateQuery:
+      name: plate
+      in: query
+      required: false
+      description: Act on this plate (index from 0) instead of the current one.
+      schema: { type: integer, minimum: 0 }
 
   responses:
     Unauthorized:
@@ -969,7 +1301,8 @@ components:
     UiTimeout:
       description: |
         The GUI thread did not run the task within its budget (10s by default,
-        120s for POST /model, 30s for GET /plate/render). The task is cancelled
+        120s for POST /model, /project/save and /project/open, 60s for
+        /project/new, 30s for GET /plate/render). The task is cancelled
         before it runs, so it does not apply its effects afterwards.
       content:
         application/json:
@@ -995,6 +1328,37 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: job_running }
+    UnknownPlate:
+      description: "`unknown_plate` — no plate has that index; `count` gives how many there are."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: unknown_plate, count: 2 }
+    BadPlateIndex:
+      description: "`bad_plate_index` — the path segment is not an integer."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: bad_plate_index }
+    BadPlateParam:
+      description: "`bad_param` with `param: plate` — the plate query value is not a non-negative integer."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: bad_param, param: plate }
+    PlateResult:
+      description: The plate after the operation.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Plate" }
+    ProjectBlocked:
+      description: |
+        `busy_slicing`, or `project_dirty` when the project or presets have
+        unsaved changes (carrying `model_dirty` and `presets_dirty`) and discard
+        was not set.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     PlateEmpty:
       description: "`empty` — the plate holds no objects."
       content:
@@ -1082,6 +1446,8 @@ components:
         bbox_min:             { $ref: "#/components/schemas/Vec3" }
         bbox_max:             { $ref: "#/components/schemas/Vec3" }
         on_plate:             { type: boolean, description: The bounding box sits on the bed within 0.05 mm. }
+        plate:                { type: integer, description: The plate instance 0 is on; -1 for none. }
+        instance_plates:      { type: array, items: { type: integer }, description: The plate of each instance; -1 for none. }
         config:
           type: object
           additionalProperties: { type: string }
@@ -1098,6 +1464,10 @@ components:
           type: array
           items: { type: string }
         project:     { type: string }
+        current_plate: { type: integer }
+        plate_count:   { type: integer }
+        project_dirty: { type: boolean, description: The project has unsaved changes. }
+        presets_dirty: { type: boolean, description: An edited preset has unsaved changes. }
         objects:
           type: array
           items:
@@ -1173,9 +1543,78 @@ components:
         state:    { type: string, enum: [idle, slicing, done, error] }
         percent:  { type: integer, description: -1 when no slice is in progress. }
         message:  { type: string }
+        plate:    { type: integer, description: The plate the slice ran on; -1 before any. }
         warnings: { type: array, items: { $ref: "#/components/schemas/SliceWarning" } }
         stats:    { $ref: "#/components/schemas/SliceStats" }
         breakdown:
           allOf:
             - $ref: "#/components/schemas/Breakdown"
           description: Mirrored at the top level as well as inside stats.
+
+    SliceNotStarted:
+      type: object
+      required: [error, reason, message]
+      properties:
+        error:   { type: string, enum: [slice_not_started] }
+        plate:   { type: integer }
+        reason:  { type: string, enum: [outside, validation, invalid_state] }
+        message: { type: string, description: The text the slicer's own notification shows. }
+        opt_key: { type: string, description: The setting the validation names, when it names one. }
+        object:  { type: string, description: The object the validation names, when it names one. }
+
+    PlateObject:
+      type: object
+      properties:
+        id:       { type: integer, format: int64 }
+        name:     { type: string }
+        instance: { type: integer }
+
+    Plate:
+      type: object
+      properties:
+        index:                    { type: integer }
+        name:                     { type: string }
+        current:                  { type: boolean }
+        locked:                   { type: boolean, description: Skipped by arrange and orient. }
+        empty:                    { type: boolean }
+        printable:                { type: boolean }
+        slice_result_valid:       { type: boolean }
+        origin:                   { type: array, items: { type: number }, minItems: 2, maxItems: 2 }
+        bed:
+          type: object
+          description: The plate's bed in world coordinates.
+          properties:
+            min: { type: array, items: { type: number } }
+            max: { type: array, items: { type: number } }
+        bed_type:                 { type: string, description: A bed type name, or "default" to follow the global one. }
+        effective_bed_type:       { type: string }
+        print_sequence:           { type: string, enum: [default, "by layer", "by object"] }
+        effective_print_sequence: { type: string, enum: ["by layer", "by object"] }
+        first_layer_sequence:     { type: array, items: { type: integer }, description: 1-based filament numbers; empty for automatic. }
+        spiral_mode:
+          description: The plate's own setting, or "default" to follow the global one.
+          oneOf:
+            - { type: boolean }
+            - { type: string, enum: [default] }
+        effective_spiral_mode:    { type: boolean }
+        objects:                  { type: array, items: { $ref: "#/components/schemas/PlateObject" } }
+
+    PlateUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name:   { type: string }
+        locked: { type: boolean }
+        bed_type:
+          type: string
+          enum: [default, Cool Plate, Engineering Plate, High Temp Plate, Textured PEI Plate,
+                 Textured Cool Plate, Supertack Plate]
+        print_sequence: { type: string, enum: [default, "by layer", "by object"] }
+        first_layer_sequence:
+          type: array
+          items: { type: integer, minimum: 1 }
+        spiral_mode:
+          oneOf:
+            - { type: boolean }
+            - { type: string, enum: [default] }
+      example: { name: Clips, bed_type: Textured PEI Plate, print_sequence: by object }

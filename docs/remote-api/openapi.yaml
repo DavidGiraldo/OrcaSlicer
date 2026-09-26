@@ -317,7 +317,9 @@ paths:
 
         A name the preset was renamed from is accepted and resolved; `selected`
         is always the current name. A filament goes into the project filament
-        slot `slot` (1-based, default 1), which is what slicing uses. A printer
+        slot `slot` (1-based, default 1), which is what slicing uses, and
+        becomes the edited preset that PUT /config and POST /preset/save act
+        on. A printer
         that exists but is not installed is made visible for the session and
         selected; a hidden print or filament preset is refused.
       requestBody:

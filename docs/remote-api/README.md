@@ -254,7 +254,9 @@ preset's current one: a name the preset was since renamed from is accepted and r
 
 A filament goes into a project filament slot, the one the sidebar numbers from 1, given as
 `"slot"` (default `1`); the response then also carries `"slot"`. This is what the sidebar
-dropdown does, and it is what slicing uses. `slot` is only accepted with `type: "filament"`.
+dropdown does, and it is what slicing uses. The filament also becomes the edited preset, as the
+slot's edit button makes it, so a following `PUT /config` or `POST /preset/save` acts on it.
+`slot` is only accepted with `type: "filament"`.
 
 ```json
 {"type": "filament", "name": "Generic PETG", "slot": 2}

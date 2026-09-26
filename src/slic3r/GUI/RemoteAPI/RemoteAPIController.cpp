@@ -12,6 +12,7 @@
 #include "slic3r/GUI/NotificationManager.hpp" // in-app change notifications
 #include "libslic3r/AppConfig.hpp"             // remote_api_notify toggle
 #include "slic3r/GUI/Tab.hpp"
+#include "slic3r/GUI/PresetComboBoxes.hpp" // PUT /preset: refresh a filament slot's sidebar combo
 #include "slic3r/GUI/BackgroundSlicingProcess.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Print.hpp"
@@ -1159,18 +1160,39 @@ Response Controller::handle_select_preset(const std::string &body)
                         type_s == "printer"  ? Preset::TYPE_PRINTER : Preset::TYPE_INVALID;
     if (type == Preset::TYPE_INVALID)
         return { 400, {{"error", "unknown_type"}} };
+    // Filaments go into a project slot, 1-based as the sidebar numbers them.
+    long slot = 1;
+    if (in.contains("slot")) {
+        if (type != Preset::TYPE_FILAMENT || !in["slot"].is_number_integer() || in["slot"].get<long>() < 1)
+            return { 400, {{"error", "bad_param"}, {"param", "slot"}} };
+        slot = in["slot"].get<long>();
+    }
 
-    nlohmann::json r = run_on_ui([type, name]() -> nlohmann::json {
+    nlohmann::json r = run_on_ui([type, name, slot]() -> nlohmann::json {
         auto *bundle = wxGetApp().preset_bundle;
         PresetCollection &presets = type == Preset::TYPE_PRINT    ? bundle->prints :
                                     type == Preset::TYPE_FILAMENT ? bundle->filaments :
                                                                     bundle->printers;
         // Validate up front: select_preset silently falls back to a visible preset
         // for an unknown name, so its return can't be trusted for a 422.
-        if (presets.find_preset(name, false, true) == nullptr)
+        Preset *preset = presets.find_preset(name, false, true);
+        if (preset == nullptr)
             return {{"error", "unknown_preset"}};
+        // find_preset follows renamed_from; select_preset_by_name does not, so select by the real name.
+        const std::string real_name = preset->name;
+        // select_preset_by_name only matches a visible preset and otherwise falls back to the first
+        // visible one while still reporting success. A printer that is merely not installed is made
+        // visible first, as the sidebar does when a printer model is picked; anything else hidden
+        // would silently select a different preset, so refuse it.
+        if (!preset->is_visible) {
+            if (type != Preset::TYPE_PRINTER)
+                return {{"error", "preset_not_installed"}};
+            preset->is_visible = true;
+        }
         Tab *tab = wxGetApp().get_tab(type);
         if (tab == nullptr) return {{"error", "tab_unavailable"}};
+        if (type == Preset::TYPE_FILAMENT && size_t(slot) > bundle->filament_presets.size())
+            return {{"error", "bad_slot"}, {"slots", bundle->filament_presets.size()}};
         // Discard un-applied GUI edits on EVERY collection Tab::select_preset may
         // inspect. It consults dependent tabs too (switching a print/printer preset
         // checks the filament/print collections' dirty state), and ANY dirty one
@@ -1184,18 +1206,53 @@ Response Controller::handle_select_preset(const std::string &body)
         discard_if_dirty(bundle->filaments);
         discard_if_dirty(bundle->sla_materials);
         discard_if_dirty(bundle->printers);
-        bool ok = tab->select_preset(name, false, "", /*force_select=*/true, /*force_no_transfer=*/true);
+        Plater *plater = wxGetApp().plater();
+        if (type == Preset::TYPE_FILAMENT) {
+            // A filament is used through its project slot, not the Tab: selecting it in the Tab
+            // alone changes nothing that slices. Mirror the sidebar combo
+            // (Plater::priv::on_select_preset): write the slot, and drive the Tab only when the
+            // project has a single filament.
+            const size_t idx         = size_t(slot - 1);
+            const bool   was_support = is_support_filament(int(idx));
+            bundle->set_filament_preset(idx, real_name);
+            plater->update_project_dirty_from_presets();
+            bundle->export_selections(*wxGetApp().app_config);
+            Sidebar &sidebar = plater->sidebar();
+            sidebar.update_dynamic_filament_list();
+            if (is_support_filament(int(idx)) != was_support && wxGetApp().app_config->get("auto_calculate_flush") == "all")
+                sidebar.auto_calc_flushing_volumes(int(idx));
+            if (bundle->filament_presets.size() > 1) {
+                if (idx < sidebar.combos_filament().size())
+                    sidebar.combos_filament()[idx]->update();
+                return {{"selected", real_name}, {"slot", slot}};
+            }
+        }
+        bool ok = tab->select_preset(real_name, false, "", /*force_select=*/true, /*force_no_transfer=*/true);
         if (!ok) return {{"error", "select_cancelled"}};
-        return {{"selected", name}};
+        // Tab::select_preset reports success even when it fell back to another preset.
+        const std::string selected = presets.get_selected_preset_name();
+        if (selected != real_name)
+            return {{"error", "selection_fell_back"}, {"selected", selected}};
+        if (type == Preset::TYPE_FILAMENT) {
+            plater->on_config_change(bundle->full_config());
+            return {{"selected", real_name}, {"slot", slot}};
+        }
+        return {{"selected", real_name}};
     });
     if (r.contains("error")) {
         if (r["error"] == "unknown_preset") {
             api_notify("No such " + type_s + " preset '" + name + "'", true);
             return { 422, r };
         }
+        if (r["error"] == "preset_not_installed" || r["error"] == "bad_slot")
+            return { 422, r };
+        if (r["error"] == "selection_fell_back") {
+            api_notify("Could not select " + type_s + " preset '" + name + "'", true);
+            return { 409, r };
+        }
         return { 500, r };
     }
-    api_notify("Switched to " + type_s + " preset '" + name + "'");
+    api_notify("Switched to " + type_s + " preset '" + r["selected"].get<std::string>() + "'");
     return { 200, r };
 }
 

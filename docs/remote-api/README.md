@@ -249,13 +249,28 @@ Errors: `400 missing_path`, `404 not_found`, `422 unsupported_format`, `422 load
 {"type": "print", "name": "0.20mm Standard"}
 ```
 
-`type` is `print`, `filament` or `printer`. Returns `{"selected": "<name>"}`.
+`type` is `print`, `filament` or `printer`. Returns `{"selected": "<name>"}`, where the name is the
+preset's current one: a name the preset was since renamed from is accepted and resolved.
+
+A filament goes into a project filament slot, the one the sidebar numbers from 1, given as
+`"slot"` (default `1`); the response then also carries `"slot"`. This is what the sidebar
+dropdown does, and it is what slicing uses. `slot` is only accepted with `type: "filament"`.
+
+```json
+{"type": "filament", "name": "Generic PETG", "slot": 2}
+```
+
+A printer that exists but is not installed (listed with `"visible": false`) is made visible for the
+session and selected, as the sidebar does when a printer model is picked. A hidden print or
+filament preset is refused with `preset_not_installed` rather than silently replaced by another.
 
 > Unsaved changes in the edited presets are **discarded** first, so the selection cannot block on
 > the modal unsaved-changes dialog.
 
-Errors: `400 missing_fields`, `400 unknown_type`, `422 unknown_preset`, `500 tab_unavailable`,
-`500 select_cancelled`.
+Errors: `400 missing_fields`, `400 unknown_type`, `400 bad_param` (`slot`), `422 unknown_preset`,
+`422 preset_not_installed`, `422 bad_slot` (the body carries the project's `slots`),
+`409 selection_fell_back` (the slicer selected a different preset; the body carries it as
+`selected`), `500 tab_unavailable`, `500 select_cancelled`.
 
 ### POST /preset/save
 

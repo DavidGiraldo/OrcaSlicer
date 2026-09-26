@@ -76,6 +76,9 @@ Build and test per upstream's AGENTS.md. Two fork-specific notes:
   exit code can still look benign. Read the output rather than the exit code. Rebuild only the
   dependencies that are genuinely new or differently configured, not all of them.
 - The test `Smoothing multiline lightning infill keeps its outlines connected` fails
-  intermittently on a strict inequality. It is never a fork regression: the test binaries link
-  `libslic3r` and `test_common` only, never `libslic3r_gui`, where all Remote API code lives.
-  Re-run it before investigating.
+  intermittently on a strict inequality. It is never a fork regression: it lives in the
+  `fff_print` suite, which links `libslic3r` and `test_common` only, never `libslic3r_gui`, where
+  all Remote API code lives. Re-run it before investigating.
+- No test exercises the Remote API. `slic3rutils_tests` does link `libslic3r_gui`, but the
+  controller needs a running `GUI_App` and `Plater`, so route behaviour is verified live against
+  the running application over HTTP, not in `ctest`.

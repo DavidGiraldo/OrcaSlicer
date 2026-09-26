@@ -314,11 +314,17 @@ paths:
       description: |
         Unsaved changes in the edited presets are discarded first, so the
         selection cannot block on the modal unsaved-changes dialog.
+
+        A name the preset was renamed from is accepted and resolved; `selected`
+        is always the current name. A filament goes into the project filament
+        slot `slot` (1-based, default 1), which is what slicing uses. A printer
+        that exists but is not installed is made visible for the session and
+        selected; a hidden print or filament preset is refused.
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/PresetRef" }
+            schema: { $ref: "#/components/schemas/PresetSelect" }
       responses:
         "200":
           description: Selected.
@@ -328,12 +334,22 @@ paths:
                 type: object
                 properties:
                   selected: { type: string }
+                  slot:
+                    type: integer
+                    description: Filament only - the slot that was assigned.
         "400":
-          description: "`invalid_json`, `missing_fields` or `unknown_type`."
+          description: "`invalid_json`, `missing_fields`, `unknown_type` or `bad_param` (`slot`)."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: |
+            `selection_fell_back` - the slicer selected a different preset, named
+            in `selected`.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "422":
-          description: "`unknown_preset`."
+          description: |
+            `unknown_preset`, `preset_not_installed` (a hidden print or filament
+            preset) or `bad_slot` (past the project's `slots`).
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "504": { $ref: "#/components/responses/UiTimeout" }
         "500":
@@ -1025,6 +1041,17 @@ components:
       properties:
         type: { type: string, enum: [print, filament, printer] }
         name: { type: string }
+
+    PresetSelect:
+      allOf:
+        - $ref: "#/components/schemas/PresetRef"
+        - type: object
+          properties:
+            slot:
+              type: integer
+              minimum: 1
+              default: 1
+              description: Filament only - the project filament slot, numbered from 1 as in the sidebar.
 
     PresetListItem:
       type: object

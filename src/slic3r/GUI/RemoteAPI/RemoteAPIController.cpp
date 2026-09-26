@@ -1209,9 +1209,10 @@ Response Controller::handle_select_preset(const std::string &body)
         Plater *plater = wxGetApp().plater();
         if (type == Preset::TYPE_FILAMENT) {
             // A filament is used through its project slot, not the Tab: selecting it in the Tab
-            // alone changes nothing that slices. Mirror the sidebar combo
-            // (Plater::priv::on_select_preset): write the slot, and drive the Tab only when the
-            // project has a single filament.
+            // alone changes nothing that slices. Write the slot as the sidebar combo does
+            // (Plater::priv::on_select_preset), then also select it in the Tab below, as the
+            // slot's edit button does, so that PUT /config and POST /preset/save act on this
+            // filament. With several filaments, the Tab's own sync does not touch the slots.
             const size_t idx         = size_t(slot - 1);
             const bool   was_support = is_support_filament(int(idx));
             bundle->set_filament_preset(idx, real_name);
@@ -1221,11 +1222,6 @@ Response Controller::handle_select_preset(const std::string &body)
             sidebar.update_dynamic_filament_list();
             if (is_support_filament(int(idx)) != was_support && wxGetApp().app_config->get("auto_calculate_flush") == "all")
                 sidebar.auto_calc_flushing_volumes(int(idx));
-            if (bundle->filament_presets.size() > 1) {
-                if (idx < sidebar.combos_filament().size())
-                    sidebar.combos_filament()[idx]->update();
-                return {{"selected", real_name}, {"slot", slot}};
-            }
         }
         bool ok = tab->select_preset(real_name, false, "", /*force_select=*/true, /*force_no_transfer=*/true);
         if (!ok) return {{"error", "select_cancelled"}};

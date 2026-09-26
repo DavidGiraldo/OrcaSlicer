@@ -42,6 +42,57 @@ Settled questions, kept here so they are not argued again on the next sync.
 
 ---
 
+## 2026-09-25 — rebase onto upstream `93b58a2034`
+
+Previous base `f956914a11` (2026-09-18). **137 upstream commits** absorbed; 49 fork commits
+replayed. No dependency needed rebuilding: the `deps/` changes were clang-cl and GCC 15
+compatibility, with no `URL`, hash or tag change.
+
+### Conflicts
+
+One, in `.gitignore`: upstream `505a46b280` dropped the `/.test/` rule when `check_profile` moved its
+downloads to a per-user cache, and the fork's commit carried that line as context. Upstream's
+removal was honoured and the fork's own ignore lines kept.
+
+### From MaxEllis
+
+Nothing new. His two latest commits on `remote-api-port` (2026-09-17) were triaged in the previous
+sync.
+
+### What the clean rebase was hiding
+
+**Plate renders lost their GL context guarantee.** Upstream `42009cf385` made both
+`render_thumbnail` overloads bind the shown canvas's context first, because thumbnails render
+outside `render()` where another library's context — WebKitGTK's, on Linux — can be current. The
+fork's `render_plate_thumbnail` and `render_gcode_thumbnail`, which `GET /plate/render` drives from
+exactly that situation, did not. With `66b300987b` now building web panels lazily on idle, a
+webview context being current when the API call arrives became more likely. Both now bind first.
+
+**Renamed presets passed validation and selected something else.** `24f380963b` moved third-party
+filaments into the Orca filament library with `renamed_from`. `PUT /preset` validated the name with
+`find_preset`, which follows renames, then selected with `select_preset_by_name`, which does not —
+so an old name was accepted and a different preset selected. The handler now selects by the
+resolved name.
+
+Two older defects in the same handler surfaced while switching a project to a newly used printer,
+and were fixed in the same pass:
+
+- A printer that exists but is not installed was reported as selected while the slicer fell back
+  to another, because `select_preset_by_name` only matches visible presets and reports success
+  either way. The handler now makes such a printer visible, as the sidebar does, and checks what
+  was actually selected.
+- Selecting a filament changed only the Tab's edited preset, never the project filament slot that
+  slicing reads, so the call succeeded and nothing printed with the new filament. It now assigns
+  the slot the way the sidebar dropdown does, with an optional `slot`.
+
+The rest of the 137-commit audit found nothing that breaks an API path. Two notes for later:
+`top_solid_infill_flow_ratio` became a per-variant vector (`PUT /config` writes it as one value,
+which is correct only on single-nozzle printers — a gap the other variant keys already had), and
+frames where only the overlay changed now reuse the cached scene, so an API path that edits the
+model without dirtying the canvas no longer gets a free repaint.
+
+---
+
 ## 2026-09-18 — rebase onto upstream `f956914a11`
 
 Previous base `4fd7fdb3fa` (2026-08-18). **818 upstream commits** absorbed; 41 fork commits

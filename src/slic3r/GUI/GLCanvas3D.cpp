@@ -6323,6 +6323,10 @@ bool GLCanvas3D::render_plate_thumbnail(ThumbnailData& thumbnail_data, unsigned 
     // "don't render plate in thumbnail" in render_thumbnail_internal), this frames
     // the BUILD VOLUME and draws bed + plate grid, so a caller can see where the
     // model sits, whether it touches the plate, and its first-layer footprint.
+    // orca-mcp: the Remote API calls this outside render(), where another library's GL context can
+    // be current. Bind ours first, as upstream's render_thumbnail() does since 42009cf385.
+    if (!_set_shown_canvas_current())
+        return false;
     PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
     if (plate == nullptr)
         return false;
@@ -6449,6 +6453,10 @@ bool GLCanvas3D::render_gcode_thumbnail(ThumbnailData& thumbnail_data, unsigned 
     // Remote API: offscreen render of the gcode preview (toolpaths incl. support).
     // FBO scaffold mirrors render_thumbnail_framebuffer(); camera setup mirrors
     // render_thumbnail_internal(). No legend/sliders/ImGui by construction.
+    // orca-mcp: bind our GL context first, as in render_plate_thumbnail() - load_gcode_preview()
+    // below already needs it.
+    if (!_set_shown_canvas_current())
+        return false;
     if (!m_gcode_viewer.has_data()) {
         // Preview::load_print_as_fff() only calls load_gcode_preview() inside
         // `if (IsShown())`, so an API-driven slice with the editor tab in front

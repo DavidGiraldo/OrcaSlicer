@@ -39,6 +39,113 @@ Settled questions, kept here so they are not argued again on the next sync.
   binary cannot pass the CLI suite upstream added on 2026-09-08. This fork rebases onto current
   `origin/main`, so cloning that repository's `HEAD` is exactly right, and a pin would freeze CI
   against a stale suite. `build_orca.yml` is byte-identical to upstream here.
+- **His CI changes for his own build matrix** — the Windows ARM64 CMake pins, `build_release_vs.bat`
+  (upstream replaced that script with `build_win.bat`, which already fails on a CMake error) and the
+  macOS ad-hoc signing step. This fork's workflows track upstream byte for byte and it ships no macOS
+  build; revisit the signing step, guarded by repository and marked, if it ever does.
+
+### Where his work lands
+
+Triage covers `remote-api-port` **and** `remote-api-242`. Since 2026-10 his Remote API fixes land on
+`remote-api-242` (and its `fix/*` branches) and only some reach `remote-api-port`, so watching one
+branch misses them.
+
+---
+
+## 2026-10-10 — rebase onto upstream `e4142db820`
+
+Previous base `93b58a2034` (2026-09-25). **768 upstream commits** absorbed; 55 fork commits
+replayed.
+
+### Conflicts
+
+Four, none of substance:
+
+- `Plater.hpp`: upstream `c44f2d6324` removed the MakerWorld publish dialog and with it
+  `EVT_PUBLISH`, which the fork's declaration line carried as a neighbour. Only the fork's
+  `EVT_PROCESS_COMPLETED` declaration was kept.
+- `Plater.cpp` and `MainFrame.cpp`: include lists; both sides kept.
+- `.gitignore`: both sides' ignore lines kept.
+
+### Dependencies
+
+Rebuilt selectively, with no full deps rebuild: CGAL 5.6.3 → 6.2.1 (`e729dbf142`), OCCT 7.6 → 8.0.1
+(`78a4f2867c`, plus the BRepMesh seam patch from `8790b07773`), the new LibDataChannel
+(`a5413efc37`, linked by `libslic3r_gui`) and FFMPEG's newer prebuilt zip. GLEW and OpenCSG left the
+tree (`35bac4cb69`) and need nothing. `cmake_minimum_required` and the forwarded
+`CMAKE_POLICY_VERSION_MINIMUM` went from 3.5 to 3.10, which changes every CMake dependency's
+configure command, so anything a rebuilt target depends on (Boost, for CGAL) reconfigures and
+relinks too. The OpenSSL, Python and EXPAT recipe changes are Linux, macOS or ARM64 only.
+
+### From MaxEllis
+
+Three new commits on `remote-api-port` and four more that so far exist only on `remote-api-242`
+and `fix/remote-api-per-filament-writes-and-objectlist`. None applied as-is to this fork's diverged
+controller; the controller changes were ported by hand in one commit:
+
+- **Taken, extended — the sensitive-key policy** (`81b6da6580`, controller half of `bedca3633e`).
+  `PUT /config` let anyone with the token change `post_process`, which runs a program on the host —
+  on every slice for BBL printers — and `POST /preset/config` returned the printhost credentials
+  verbatim. Changing scripts, G-code templates, the printer connection, `printer_model` or
+  `filename_format` now needs a Preferences opt-in; credentials are redacted. His key list is
+  extended with upstream's Python plugin keys (`slicing_pipeline_plugin`, `plugins`,
+  `*_plugin_config_overrides`), which also run code at slice time. Not covered, by design: a
+  `.3mf` opened through `POST /project/open` brings its own `post_process`, as the GUI's Open does.
+  His `guard.py` second check lives in his MCP server; this fork's MCP has none, so the API is the
+  only barrier.
+- **Taken — per-filament length check, discard reporting, object-list refresh** (`2b9f39f168`,
+  docs from `a1d033928e`). The length check also covers the keys upstream made per-variant in this
+  window (`pressure_advance`, the fan speeds, `nozzle_temperature_range_*`, …): a single value
+  written to a filament preset that holds one per variant is refused instead of collapsing them.
+- **Skipped** — the CI commits (`bedca3633e`'s workflow half, `fbe47d4fa5`, `dd51650350`,
+  `a04b6b7bd5`), see the standing decisions; his README banner hunk.
+
+### What the clean rebase was hiding
+
+**A new modal on printer switch and project open.** Upstream `1241dd5521` added
+`Plater::normalize_bed_types`, which resets per-plate bed types on single-bed printers and announces
+it with a modal `show_info`. `PUT /preset` (printer) and `POST /project/open` both reach it on the GUI
+thread, so one API call would block every later one until someone clicked OK. While an API task is
+running the reset now happens with a non-modal notification. The same commit disabled per-plate bed
+types in the dialog for single-bed printers; `PUT /plates/{i}` now refuses them the same way.
+
+**More modals reachable from `PUT /config`.** `92d30fbc55` added a reset-and-warn modal for
+`filament_ironing_spacing`, and the belt-printer work added one for raft or draft shield on a belt.
+They join a family that predates this sync: `TabFilament::update` and
+`ConfigManipulation::update_print_fff_config` raise more than fifteen `MessageDialog`s from values a
+config write can set — volumetric speed, ironing spacing, compensation limits, layer heights, and
+Yes/No questions such as prime tower with adaptive layer height. Any of them wedges the API.
+Patching the two new ones would not address the class; it needs one mechanism that answers these
+dialogs during an API task and reports what they did, which is a design change and is left for its
+own commit.
+
+**Two crash reports from the previous base are fixed upstream.** A slice cancel — from the GUI or
+the API — left `initial_tool` unset, and the old base's `on_process_completed` evaluated
+`filename_format` to name a lifecycle event without a try/catch; the exception escaped the main
+loop. `ec0d8c225f` names the event from the model instead. The access violation seen seconds after
+such a cancel was the same crash during the resulting shutdown (`~GLCanvas3D` reaching a freed
+notification manager, because `is_closing()` is never set on an exception exit).
+
+**The fork's own cancel race.** The cancel route cleared the slicer's `m_is_slicing` while the
+"cancelled" completion event was still queued, so a `POST /slice` in between could start a slice
+that event then stopped. Fixed in the same pass.
+
+Not fixed, noted: the API's toolpath-outside-the-plate check does not yet mirror the G-code viewer's
+belt-printer branch (`69e7cc1544`), so it reports a false positive on belt printers. G-code export
+remains one layer at a time (`GCode::process_layers`); this window brings only small constant
+speedups to it.
+
+### Result
+
+RelWithDebInfo builds cleanly. `ctest`: 1862 of 1863 pass. The exception,
+`Hollowed cube should be supported from the inside` (`sla_print`), fails deterministically here and
+passes on upstream's own CI at the same commit (`build_all` run 38022558147, Windows x64 Release).
+The fork does not touch that code — its only `libslic3r` edits are in `Format/bbs_3mf` — so the
+difference is this machine's build (RelWithDebInfo, locally built dependencies), not the fork; it
+is left for a separate look. A live run against the application passed for every route changed
+here: the policy refusals and the write-back exemption, credential redaction, the per-filament
+length check, `discarded_changes`, a printer switch that no longer blocks, and cancel while idle.
+The `bed_type` refusal itself was not exercised, because the printer at hand has several bed types.
 
 ---
 

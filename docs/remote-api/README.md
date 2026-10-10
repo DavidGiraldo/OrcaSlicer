@@ -21,6 +21,7 @@ Preferences → Remote API.
 | Port | `remote_api_port` | `13130` | Listening port |
 | Allow LAN access | `remote_api_bind_lan` | off | Off binds `127.0.0.1`; on binds `0.0.0.0` |
 | Notify on API changes | `remote_api_notify` | on | Show an in-app toast when the API changes something |
+| Allow script, G-code and connection edits | `remote_api_allow_sensitive` | off | Lift the [sensitive-key policy](#sensitive-keys) |
 | Token | `remote_api_token` | generated | 32 hex characters from OpenSSL's CSPRNG |
 
 The server starts and stops when the Preferences dialog closes. If the port cannot be bound the
@@ -109,7 +110,8 @@ curl -H "X-Api-Token: $T" http://127.0.0.1:13130/api/v1/status
   "app": "OrcaSlicer", "app_version": "2.5.0-dev", "api_version": "1.0",
   "capabilities": ["status","config","slice","events","model","preset","gcode",
                    "objects","arrange","orient","object_config","slice_breakdown","plate_render",
-                   "plates"],
+                   "plates","sensitive_key_policy"],
+  "sensitive_keys_allowed": false,
   "project": "/path/to/project.3mf",
   "current_plate": 0, "plate_count": 2,
   "project_dirty": false, "presets_dirty": false,
@@ -121,7 +123,8 @@ curl -H "X-Api-Token: $T" http://127.0.0.1:13130/api/v1/status
 }
 ```
 
-`modified` lists the keys dirty in each edited preset.
+`modified` lists the keys dirty in each edited preset. `sensitive_keys_allowed` reports the
+[sensitive-key](#sensitive-keys) preference.
 
 ### GET /config
 
@@ -168,8 +171,35 @@ with `applied` empty and a reason per failing key:
 
 Reason strings include `unknown_key`, `not_editable_in_current_config`,
 `key_dropped_by_legacy_handler`, `unsupported value type`,
-`expected at least one value, got an empty list`, and the text of whatever the strict deserializer
-threw.
+`expected at least one value, got an empty list`, `blocked_by_remote_api_policy`,
+`redacted_placeholder`, `per_filament_length_mismatch: …`, and the text of whatever the strict
+deserializer threw.
+
+#### Sensitive keys
+
+Some keys are not slicing settings. Changing them is refused with `blocked_by_remote_api_policy`
+unless **Allow script, G-code and connection edits** is ticked in Preferences → Remote API:
+
+- `post_process`, which runs programs on this computer, and the Python slicing plugins
+  (`slicing_pipeline_plugin`, `plugins`, `*_plugin_config_overrides`);
+- every G-code template, any key ending in `_gcode` except the `emit_machine_limits_to_gcode`
+  toggle;
+- the printer connection: `print_host`, `print_host_webui`, `host_type`, `printer_agent`, every
+  `printhost_*` key and the other physical-printer options;
+- `printer_model` and `filename_format`.
+
+Writing a key back to the value it already has is not a change and passes, so snapshot-and-restore
+callers keep working. Writing the `<redacted>` placeholder that `POST /preset/config` returns is
+refused with `redacted_placeholder`. Credentials never appear in the in-app change notification.
+
+#### Per-filament keys
+
+`GET /config` reports a vector-valued filament key merged across every loaded filament slot, for
+example `"215,215,215,215"` with four slots. `PUT /config` writes the one filament preset open in
+the Filament tab, which holds a single value, or one per extruder variant. Write that preset's own
+value (`"215"`); a write that would change the vector's length is the merged shape and is refused
+with `per_filament_length_mismatch: …`, which states the expected length. To change another slot,
+select its preset with `PUT /preset` first.
 
 #### Project-scope keys (multi-material and purge)
 
@@ -306,7 +336,10 @@ session and selected, as the sidebar does when a printer model is picked. A hidd
 filament preset is refused with `preset_not_installed` rather than silently replaced by another.
 
 > Unsaved changes in the edited presets are **discarded** first, so the selection cannot block on
-> the modal unsaved-changes dialog.
+> the modal unsaved-changes dialog. Every response, success or error, carries
+> `discarded_changes`: the groups (`print`, `filament`, `sla_material`, `printer`) whose unsaved
+> changes were dropped. A filament switch can drop print and printer edits too, including ones made
+> by hand in the window, and the in-app notification names them.
 
 Errors: `400 missing_fields`, `400 unknown_type`, `400 bad_param` (`slot`), `422 unknown_preset`,
 `422 preset_not_installed`, `422 bad_slot` (the body carries the project's `slots`),
@@ -339,6 +372,10 @@ encoding.
 ```json
 {"name": "Generic PLA @MyPrinter", "system": true, "config": {"…": "…"}}
 ```
+
+Values are returned as stored, except the printer connection's credentials: `printhost_apikey`,
+`printhost_user` and `printhost_password` come back as `<redacted>` when set, and a
+`user:password@` inside `print_host` or `print_host_webui` is replaced the same way.
 
 Errors: `400 missing_fields`, `400 unknown_type`, `404 unknown_preset`.
 
@@ -413,7 +450,10 @@ A flat object of per-object settings, validated and applied atomically like `PUT
 {"applied": ["wall_loops"], "errors": {}, "object": "cube"}
 ```
 
-On failure, `422` with `applied` empty and `errors` populated. Errors: `404 unknown_object`.
+On failure, `422` with `applied` empty and `errors` populated. A [sensitive key](#sensitive-keys) is
+refused with `blocked_by_remote_api_policy` unless the preference allows it; a per-object override
+of those is never a slicing need, so the write-back exemption does not apply here. Setting
+`extruder` also updates the object list's filament column. Errors: `404 unknown_object`.
 
 ### PUT /objects/{id}/layer_height
 

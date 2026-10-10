@@ -1259,9 +1259,12 @@ Response Controller::handle_slice(const std::string &target)
     // All checks + the state transition run on the GUI thread inside run_on_ui,
     // so they are serialized (no TOCTOU between the guard and the state change).
     nlohmann::json r = run_on_ui([this, plate]() -> nlohmann::json {
-        if (slice_state().state == "slicing")
-            return {{"error", "already_slicing"}};
         Plater *plater = wxGetApp().plater();
+        // The slicer's own flag as well as ours: after a cancel it stays set until the queued
+        // "cancelled" completion event runs, and a slice started before then would be stopped by
+        // that event's on_process_completed. It also covers a slice started from the window.
+        if (slice_state().state == "slicing" || plater->is_background_process_slicing())
+            return {{"error", "already_slicing"}};
         if (plater->model().objects.empty())
             return {{"error", "nothing_to_slice"}};
         if (nlohmann::json e = select_plate_for(plater, plate); !e.is_null())
@@ -2451,6 +2454,16 @@ Response Controller::handle_put_plate(int index, const std::string &body)
         for (int n : first_layer)
             if (size_t(n) > filaments)
                 return {{"error", "invalid_settings"}, {"errors", {{"first_layer_sequence", "the project has " + std::to_string(filaments) + " filament(s)"}}}};
+        // A per-plate bed type exists only where the GUI offers one (PlateSettingsDialog,
+        // Plater::normalize_bed_types): a BBL printer or one with support_multi_bed_types.
+        // Anywhere else the override is invisible, and the next printer switch or project load
+        // silently resets it.
+        if (in.contains("bed_type") && bed_type != btDefault) {
+            PresetBundle &bundle = *wxGetApp().preset_bundle; // is_bbl_vendor() is not const
+            if (!bundle.is_bbl_vendor() && !bundle.printers.get_edited_preset().config.opt_bool("support_multi_bed_types"))
+                return {{"error", "invalid_settings"},
+                        {"errors", {{"bed_type", "the selected printer has a single bed type; set curr_bed_type through PUT /config"}}}};
+        }
 
         if (in.contains("name")) {
             plate->set_plate_name(in["name"].get<std::string>());

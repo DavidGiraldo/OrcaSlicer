@@ -15386,9 +15386,16 @@ void Plater::normalize_bed_types(bool printer_setting_changed)
 
     if (overrides_reset) {
         set_plater_dirty(true);
-        show_info(this,
-                  _L("The selected printer does not support multiple bed types.\nBed type overrides were reset to the global bed type."),
-                  _L("Plate bed types reset"));
+        const wxString msg = _L("The selected printer does not support multiple bed types.\nBed type overrides were reset to the global bed type.");
+        // orca-mcp: a Remote API printer switch or project open runs this on the GUI thread, and a
+        // modal there blocks every later API call until someone clicks OK. Keep the reset, say it
+        // without blocking.
+        if (RemoteAPI::Controller::api_ui_task_active())
+            get_notification_manager()->push_notification(NotificationType::CustomNotification,
+                                                          NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                                          into_u8(msg));
+        else
+            show_info(this, msg, _L("Plate bed types reset"));
     }
 
     // Refresh the controls after a capability change, even when no override was reset.
@@ -23046,11 +23053,17 @@ bool Plater::is_background_process_slicing() const
 }
 
 // Remote API (F2): abort the background slice from the API's cancel route.
+// orca-mcp: like the GUI's cancel (the slicing-progress callback in init_notification_manager,
+// which only calls stop()), a running slice leaves m_is_slicing to the queued "cancelled"
+// completion event. Clearing it here let a new POST /slice start before that event, whose
+// on_process_completed then stopped the new slice. Only a stale flag with nothing running is
+// cleared directly - the unwedge this route exists for.
 void Plater::stop_background_slicing()
 {
     if (p->background_process.running())
         p->background_process.stop();
-    p->m_is_slicing = false;
+    else
+        p->m_is_slicing = false;
 }
 
 //BBS: update slicing context

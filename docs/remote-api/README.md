@@ -235,8 +235,10 @@ the fallback.
 `?plate=N` slices plate N; every response carries the `plate` it acted on.
 
 `202` when slicing begins. `200` with `{"started": false, "already_valid": true}` when the plate
-already holds a valid result. `409 already_slicing`, `409 busy_slicing`, `404 unknown_plate`,
-`422 nothing_to_slice`, or `422 slice_not_started` when the plate cannot be sliced.
+already holds a valid result. `409 already_slicing` (also while a slice started from the window
+runs, and for the moment after a cancel until the slicer has wound the old one down),
+`409 busy_slicing`, `404 unknown_plate`, `422 nothing_to_slice`, or `422 slice_not_started` when
+the plate cannot be sliced.
 
 `slice_not_started` carries the reason, found the way the Slice button finds it:
 
@@ -284,7 +286,10 @@ consumed filament. Role tokens are `outer_wall`, `inner_wall`, `sparse_infill`,
 {"cancelled": true}
 ```
 
-`cancelled` reports whether a slice was actually running.
+`cancelled` reports whether a slice was actually running. `/slice/status` turns idle at once, but
+the slicer finishes winding the old slice down on its own event, and until it has, `POST /slice`
+answers `409 already_slicing`; retry after a moment. With nothing running, the route also clears a
+slicing flag left stuck.
 
 ### POST /model
 
@@ -592,14 +597,17 @@ Any subset of these fields, validated as a whole before anything changes:
 | --- | --- |
 | `name` | a string |
 | `locked` | `true` or `false`; a locked plate is skipped by arrange and orient |
-| `bed_type` | a bed type name, or `"default"` |
+| `bed_type` | a bed type name, or `"default"`; a name only on printers with several bed types |
 | `print_sequence` | `"by layer"`, `"by object"` or `"default"` |
 | `first_layer_sequence` | 1-based filament numbers, or `[]` for automatic |
 | `spiral_mode` | `true`, `false` or `"default"` |
 
 The settings are applied as the Plate Settings dialog applies them. Turning `spiral_mode` on also
 applies the vase-mode object settings the dialog would have asked about. `200` with the plate.
-`404 unknown_plate`, `422 invalid_settings` with an `errors` object keyed by field.
+`404 unknown_plate`, `422 invalid_settings` with an `errors` object keyed by field. A per-plate
+`bed_type` other than `"default"` is refused unless the printer offers several bed types (a BBL
+printer, or one with `support_multi_bed_types`), as the Plate Settings dialog does; on any other
+printer, set `curr_bed_type` with `PUT /config`.
 
 ### DELETE /plates/{i}
 

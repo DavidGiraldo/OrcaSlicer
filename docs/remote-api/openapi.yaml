@@ -202,7 +202,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/UnknownPlate" }
         "409":
-          description: "`already_slicing`, or `busy_slicing` when switching to plate N."
+          description: "`already_slicing` (also while a slice started from the window runs, and briefly after a cancel), or `busy_slicing` when switching to plate N."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "422":
           description: |
@@ -241,7 +241,11 @@ paths:
       operationId: cancelSlice
       responses:
         "200":
-          description: "`cancelled` reports whether a slice was actually running."
+          description: |
+            `cancelled` reports whether a slice was actually running. `/slice/status`
+            turns idle at once; POST /slice answers 409 `already_slicing` until the
+            slicer has wound the old slice down. With nothing running, a stuck
+            slicing flag is cleared.
           content:
             application/json:
               schema:
@@ -1635,6 +1639,9 @@ components:
         locked: { type: boolean }
         bed_type:
           type: string
+          description: |
+            A name other than `default` is refused with 422 invalid_settings unless
+            the printer offers several bed types (BBL, or support_multi_bed_types).
           enum: [default, Cool Plate, Engineering Plate, High Temp Plate, Textured PEI Plate,
                  Textured Cool Plate, Supertack Plate]
         print_sequence: { type: string, enum: [default, "by layer", "by object"] }

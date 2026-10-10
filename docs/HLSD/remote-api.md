@@ -179,8 +179,8 @@ and it is the only file that needs to.
 ## Configuration and access control
 
 Settings live in `AppConfig` and are edited on a dedicated Preferences page: enabled, port,
-whether to bind the LAN, whether to show in-app notifications, and the token. Loading and saving
-are GUI-thread-only.
+whether to bind the LAN, whether to show in-app notifications, whether sensitive keys may be
+changed, and the token. Loading and saving are GUI-thread-only.
 
 The listener binds `127.0.0.1` unless LAN access is explicitly enabled, in which case it binds all
 interfaces. `SO_REUSEADDR` is set so that relaunching the application after a kill can rebind the
@@ -200,6 +200,20 @@ falls through to that path and is rejected there.
 
 A failure to bind is not fatal. The server logs the error, leaves itself stopped, and the
 Preferences page reports it through `running()`; the application starts normally without an API.
+
+The token authenticates a caller, but the caller is often an AI agent, which can be steered by
+text it reads. So holding the token is not enough to change the keys that reach outside slicing:
+post-processing scripts and Python slicing plugins, which run programs on the host (for BBL
+printers on every slice), the G-code templates sent to the printer, the physical-printer
+connection and its credentials, `printer_model` and `filename_format`. Config writes refuse to
+change them unless the user has ticked a separate Preferences box, off by default. The test is
+made on the re-serialized value, so writing a key back to its current value, which
+snapshot-and-restore callers do, is not a change. Per-object overrides of these keys have no
+slicing use and are refused outright. The same policy keeps credentials out of what the API
+returns and shows: reading a named preset redacts the printer-connection credentials and any
+`user:password@` in a host URL, and the in-app change notification never prints them. Opening a
+project is outside the policy: a `.3mf` that carries a post-processing script brings it in as the
+GUI's own Open does.
 
 ## Where this lives in the tree
 

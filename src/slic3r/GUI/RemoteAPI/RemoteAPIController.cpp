@@ -23,6 +23,8 @@
 #include "libslic3r/Format/bbs_3mf.hpp" // LoadStrategy (used by Plater::load_files)
 #include "libslic3r/Slicing.hpp"          // M4c: layer_height_profile_adaptive, t_layer_height_range
 #include "slic3r/GUI/GUI_ObjectList.hpp" // M4c: obj_list()->update_info_items
+#include "slic3r/GUI/ObjectDataViewModel.hpp" // object config: refresh the list's filament column
+#include "slic3r/GUI/I18N.hpp"                // _L for the list's "default" filament label
 #include "slic3r/GUI/GLCanvas3D.hpp"      // plate_render: offscreen thumbnail/gcode render
 #include "slic3r/GUI/Camera.hpp"          // plate_render: ViewAngleType
 #include "libslic3r/GCode/ThumbnailData.hpp" // plate_render: ThumbnailData/ThumbnailsParams
@@ -120,6 +122,7 @@ static std::string api_config_unit(const std::string &key)
 }
 
 static int find_object_index(const Model &model, uint64_t id); // defined with the M4b object handlers below
+static bool sensitive_writes_allowed(); // defined with the sensitive-key policy below
 
 
 void Controller::notify_config_changed(int preset_type)
@@ -278,7 +281,8 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "plates"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "plates", "sensitive_key_policy"}},
+            {"sensitive_keys_allowed", sensitive_writes_allowed()},
             {"current_plate", plates.get_curr_plate_index()},
             {"plate_count", plates.get_plate_count()},
             // The undo-stack test the "unsaved changes" prompt uses (Plater::close_with_confirm), plus
@@ -467,6 +471,90 @@ static std::string json_value_to_config_string(const nlohmann::json &v)
         return ss.str();
     }
     throw std::runtime_error("unsupported value type");
+}
+
+// ---------------------------------------------------------------------------
+// Sensitive keys
+//
+// PUT /config reaches every preset key, and some of them are not slicing settings:
+// post_process runs programs after export (and on every slice for BBL printers), the
+// Python slicing-pipeline plugins run inside the slice, the *_gcode templates go straight
+// to the printer, and the physical-printer options (print_host, printhost_*, host_type,
+// printer_agent, ...) decide where and how a print is sent and with which credentials.
+// printer_model moves OrcaSlicer onto other code paths and filename_format names the
+// exported file. An agent holding the token can be steered by text it reads, so changing
+// any of these is refused unless the user ticks Preferences > Remote API > "Allow script,
+// G-code and connection edits". Writing a key back to the value it already has is not a
+// change and passes.
+static bool is_sensitive_config_key(const std::string &key)
+{
+    static const std::string gcode_suffix = "_gcode";
+    if (key == "post_process" || key == "printer_model" || key == "filename_format" ||
+        key == "slicing_pipeline_plugin" || key == "plugins" ||
+        key.rfind("printhost_", 0) == 0)
+        return true;
+    if (key.size() > gcode_suffix.size() &&
+        key.compare(key.size() - gcode_suffix.size(), gcode_suffix.size(), gcode_suffix) == 0)
+        return key != "emit_machine_limits_to_gcode"; // a toggle, not a template
+    if (boost::algorithm::ends_with(key, "_plugin_config_overrides"))
+        return true;
+    const std::vector<std::string> &pp = PhysicalPrinter::printer_options();
+    return std::find(pp.begin(), pp.end(), key) != pp.end();
+}
+
+// GUI thread only (AppConfig).
+static bool sensitive_writes_allowed()
+{
+    return wxGetApp().app_config->get_bool("remote_api_allow_sensitive");
+}
+
+// What POST /preset/config hides. GET /config already drops the whole host block
+// (full_config_secure), but a named preset's config is returned as stored, so the
+// credentials are replaced and any user:password inside a host URL (the print_host
+// tooltip documents https://user:password@host/) is cut out. The host, CA file path and
+// port stay visible so upload problems can still be diagnosed.
+static const char *const k_redacted = "<redacted>";
+
+static bool is_credential_key(const std::string &key)
+{
+    return key == "printhost_apikey" || key == "printhost_user" || key == "printhost_password";
+}
+
+static bool is_host_url_key(const std::string &key)
+{
+    return key == "print_host" || key == "print_host_webui";
+}
+
+static std::string strip_url_userinfo(const std::string &url)
+{
+    // Only a "://" that ends the scheme counts, i.e. one that comes before any other '/'.
+    const size_t sep   = url.find("://");
+    const size_t start = (sep != std::string::npos && url.find('/') == sep + 1) ? sep + 3 : 0;
+    const size_t slash = url.find('/', start);
+    // The LAST '@' before the path, so a password containing '@' is covered too.
+    const size_t at    = url.rfind('@', slash);
+    if (at == std::string::npos || at < start)
+        return url;
+    return url.substr(0, start) + k_redacted + url.substr(at);
+}
+
+// GET /config reports the MERGED config, where every vector-valued filament key holds one
+// run of values per loaded filament slot (PresetBundle::full_fff_config sets the first slot
+// and appends the rest). A write lands in the single preset open in the Filament tab, so
+// echoing a merged value back would store the whole list in that one preset, and the next
+// merge would splice all of it in at every slot using it - the list grows on each write.
+// The preset's own vector length is authoritative (1, or more with extruder variants), so a
+// write that would CHANGE it is the merged shape and is refused.
+static bool is_merged_per_filament_key(Preset::Type type, const std::string &key, const ConfigOption *opt)
+{
+    return type == Preset::TYPE_FILAMENT && opt != nullptr && opt->is_vector() &&
+           key != "compatible_prints" && key != "compatible_printers";
+}
+
+static size_t config_vector_size(const DynamicPrintConfig &cfg, const std::string &key)
+{
+    const ConfigOption *opt = cfg.option(key);
+    return (opt == nullptr || !opt->is_vector()) ? 0 : static_cast<const ConfigOptionVectorBase *>(opt)->size();
 }
 
 // A vector option that deserialized to ZERO elements is a live crash, not a
@@ -703,6 +791,7 @@ Response Controller::handle_put_config(const std::string &body)
     // of this function's stack lifetime.
     nlohmann::json result = run_on_ui([in = std::move(in)]() -> nlohmann::json {
         auto *bundle = wxGetApp().preset_bundle;
+        const bool allow_sensitive = sensitive_writes_allowed();
 
         struct Target {
             Preset::Type        type;
@@ -806,14 +895,46 @@ Response Controller::handle_put_config(const std::string &body)
             try {
                 std::string oldv = tgt->cfg.opt_serialize(key);
                 std::string sval = json_value_to_config_string(it.value());
+                const bool sensitive = is_sensitive_config_key(key);
+                if (sensitive && sval.find(k_redacted) != std::string::npos) {
+                    // A client writing back POST /preset/config output would replace a
+                    // real credential with the placeholder.
+                    errors[key] = "redacted_placeholder";
+                    continue;
+                }
+                const bool   per_filament = is_merged_per_filament_key(tgt->type, key, tgt->cfg.option(key));
+                const size_t len_before   = per_filament ? config_vector_size(tgt->cfg, key) : 0;
                 // Orca's own validation: throws BadOptionTypeException /
                 // BadOptionValueException on garbage.
                 tgt->cfg.set_deserialize_strict(key, sval);
                 if (std::string ee = empty_vector_error(key, tgt->cfg); !ee.empty())
                     throw std::runtime_error(ee);
+                if (per_filament && config_vector_size(tgt->cfg, key) != len_before) {
+                    // The batch is atomic and bails out below without applying, so the
+                    // already-mutated staged copy needs no restore.
+                    errors[key] = "per_filament_length_mismatch: the filament preset open in the Filament tab holds " +
+                                  std::to_string(len_before) + " value(s), got " +
+                                  std::to_string(config_vector_size(tgt->cfg, key)) +
+                                  ". GET /config reports this key merged across every loaded filament slot; "
+                                  "PUT /config writes one preset. Pass just that preset's value(s).";
+                    continue;
+                }
+                const std::string newv = tgt->cfg.opt_serialize(key);
+                if (sensitive && !allow_sensitive && newv != oldv) {
+                    // Judged on the re-serialized value, so writing back the current value
+                    // (snapshot/restore callers) is not a change.
+                    errors[key] = "blocked_by_remote_api_policy";
+                    continue;
+                }
                 tgt->touched = true;
                 applied.push_back(key);
-                changes.push_back({ key, oldv, tgt->cfg.opt_serialize(key) });
+                // The notification is on screen, so it never shows a credential.
+                if (is_credential_key(key))
+                    changes.push_back({ key, "(hidden)", "(hidden)" });
+                else if (is_host_url_key(key))
+                    changes.push_back({ key, strip_url_userinfo(oldv), strip_url_userinfo(newv) });
+                else
+                    changes.push_back({ key, oldv, newv });
             } catch (const std::exception &e) {
                 errors[key] = e.what();
             }
@@ -834,6 +955,8 @@ Response Controller::handle_put_config(const std::string &body)
             for (auto it2 = errors.begin(); it2 != errors.end(); ++it2) {
                 emsg += "\n - ";
                 emsg += api_config_label(it2.key());
+                if (it2.value() == "blocked_by_remote_api_policy")
+                    emsg += " (blocked, see Preferences > Remote API)";
             }
             api_notify(emsg, true);
             return {{"applied", nlohmann::json::array()}, {"errors", errors}};
@@ -1359,13 +1482,22 @@ Response Controller::handle_select_preset(const std::string &body)
         // pops a modal UnsavedChangesDialog that would wedge the GUI thread with no
         // remote way to dismiss it. Discarding is acceptable for an automation API
         // (callers apply changes deliberately via PUT /config).
-        auto discard_if_dirty = [](PresetCollection &c) {
-            if (c.current_is_dirty()) c.discard_current_changes();
+        //
+        // It is a bigger side effect than "switch this group" suggests - a filament
+        // switch also drops unsaved print/printer edits, including ones made by hand in
+        // the GUI - so every discarded group is reported to the caller and named in the
+        // on-screen notification.
+        nlohmann::json discarded = nlohmann::json::array();
+        auto discard_if_dirty = [&discarded](PresetCollection &c, const char *group) {
+            if (c.current_is_dirty()) {
+                c.discard_current_changes();
+                discarded.push_back(group);
+            }
         };
-        discard_if_dirty(bundle->prints);
-        discard_if_dirty(bundle->filaments);
-        discard_if_dirty(bundle->sla_materials);
-        discard_if_dirty(bundle->printers);
+        discard_if_dirty(bundle->prints, "print");
+        discard_if_dirty(bundle->filaments, "filament");
+        discard_if_dirty(bundle->sla_materials, "sla_material");
+        discard_if_dirty(bundle->printers, "printer");
         Plater *plater = wxGetApp().plater();
         if (type == Preset::TYPE_FILAMENT) {
             // A filament is used through its project slot, not the Tab: selecting it in the Tab
@@ -1384,16 +1516,17 @@ Response Controller::handle_select_preset(const std::string &body)
                 sidebar.auto_calc_flushing_volumes(int(idx));
         }
         bool ok = tab->select_preset(real_name, false, "", /*force_select=*/true, /*force_no_transfer=*/true);
-        if (!ok) return {{"error", "select_cancelled"}};
+        // The discard above has already happened on every path from here, so it is reported on all of them.
+        if (!ok) return {{"error", "select_cancelled"}, {"discarded_changes", discarded}};
         // Tab::select_preset reports success even when it fell back to another preset.
         const std::string selected = presets.get_selected_preset_name();
         if (selected != real_name)
-            return {{"error", "selection_fell_back"}, {"selected", selected}};
+            return {{"error", "selection_fell_back"}, {"selected", selected}, {"discarded_changes", discarded}};
         if (type == Preset::TYPE_FILAMENT) {
             plater->on_config_change(bundle->full_config());
-            return {{"selected", real_name}, {"slot", slot}};
+            return {{"selected", real_name}, {"slot", slot}, {"discarded_changes", discarded}};
         }
-        return {{"selected", real_name}};
+        return {{"selected", real_name}, {"discarded_changes", discarded}};
     });
     if (r.contains("error")) {
         if (r["error"] == "unknown_preset") {
@@ -1408,7 +1541,13 @@ Response Controller::handle_select_preset(const std::string &body)
         }
         return { 500, r };
     }
-    api_notify("Switched to " + type_s + " preset '" + r["selected"].get<std::string>() + "'");
+    std::string msg = "Switched to " + type_s + " preset '" + r["selected"].get<std::string>() + "'";
+    if (r.contains("discarded_changes") && !r["discarded_changes"].empty()) {
+        msg += " - discarded unsaved changes in:";
+        for (const auto &g : r["discarded_changes"])
+            msg += " " + g.get<std::string>();
+    }
+    api_notify(msg);
     return { 200, r };
 }
 
@@ -1635,7 +1774,14 @@ Response Controller::handle_get_preset_config(const std::string &body)
         const Preset *p = presets->find_preset(name, false);
         if (p == nullptr) return {{"error", "unknown_preset"}};
         nlohmann::json cfg = nlohmann::json::object();
-        for (const std::string &k : p->config.keys()) cfg[k] = p->config.opt_serialize(k);
+        for (const std::string &k : p->config.keys()) {
+            std::string v = p->config.opt_serialize(k);
+            if (is_credential_key(k) && !v.empty())
+                v = k_redacted;
+            else if (is_host_url_key(k))
+                v = strip_url_userinfo(v);
+            cfg[k] = v;
+        }
         return {{"name", p->name}, {"system", p->is_system}, {"config", cfg}};
     });
     if (r.contains("error")) {
@@ -2030,9 +2176,16 @@ Response Controller::handle_put_object_config(uint64_t id, const std::string &bo
         DynamicPrintConfig cfg = mo->config.get(); // copy of existing per-object overrides
         nlohmann::json applied = nlohmann::json::array();
         nlohmann::json errors  = nlohmann::json::object();
+        const bool allow_sensitive = sensitive_writes_allowed();
         for (auto it = in.begin(); it != in.end(); ++it) {
             const std::string &key = it.key();
             if (print_config_def.get(key) == nullptr) { errors[key] = "unknown_key"; continue; }
+            // Same policy as PUT /config; a per-object override of these is never a
+            // slicing need, so there is no write-back exemption here.
+            if (!allow_sensitive && is_sensitive_config_key(key)) {
+                errors[key] = "blocked_by_remote_api_policy";
+                continue;
+            }
             try {
                 cfg.set_deserialize_strict(key, json_value_to_config_string(it.value()));
                 if (std::string ee = empty_vector_error(key, cfg); !ee.empty())
@@ -2046,6 +2199,23 @@ Response Controller::handle_put_object_config(uint64_t id, const std::string &bo
         }
         mo->config.assign_config(std::move(cfg));
         plater->changed_object(idx);
+        // changed_object() reschedules the slice and repaints the 3D scene, but not the
+        // object list's filament column, which ObjectList writes itself (SetExtruder +
+        // Refresh in set_extruder_for_selected_items). Without this the object sliced with
+        // the new filament while the list still showed the old one.
+        if (in.contains("extruder") && mo->config.has("extruder")) {
+            ObjectList *obj_list = wxGetApp().obj_list();
+            ObjectDataViewModel *om = obj_list == nullptr ? nullptr : obj_list->GetModel();
+            if (om != nullptr) {
+                wxDataViewItem item = om->GetItemById(idx);
+                if (item.IsOk()) {
+                    // 0 means "use the default", which the list spells out (ObjectDataViewModel.cpp).
+                    const int ext = mo->config.extruder();
+                    om->SetExtruder(ext == 0 ? _L("default") : wxString::Format("%d", ext), item);
+                    obj_list->Refresh();
+                }
+            }
+        }
         if (!applied.empty())
             api_notify("Updated " + std::to_string(applied.size()) + " setting(s) on '" + mo->name + "'");
         return {{"applied", applied}, {"errors", errors}, {"object", mo->name}};

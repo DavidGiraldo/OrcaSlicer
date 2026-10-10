@@ -158,8 +158,13 @@ paths:
             `not_editable_in_current_config`, `key_dropped_by_legacy_handler`,
             `unsupported value type`,
             `expected at least one value, got an empty list`, a project-scope
-            block reason like `not_writable_project_key`, or the text thrown by
-            the strict deserializer.
+            block reason like `not_writable_project_key`,
+            `blocked_by_remote_api_policy` (a sensitive key changed while the
+            Preferences toggle `remote_api_allow_sensitive` is off),
+            `redacted_placeholder` (the `<redacted>` value from POST
+            /preset/config written back), `per_filament_length_mismatch: …`
+            (a filament key written in the merged per-slot shape), or the text
+            thrown by the strict deserializer.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ConfigWriteResult" }
@@ -329,7 +334,9 @@ paths:
       operationId: selectPreset
       description: |
         Unsaved changes in the edited presets are discarded first, so the
-        selection cannot block on the modal unsaved-changes dialog.
+        selection cannot block on the modal unsaved-changes dialog. Every
+        response, success or error, carries `discarded_changes`, the groups
+        whose unsaved changes were dropped.
 
         A name the preset was renamed from is accepted and resolved; `selected`
         is always the current name. A filament goes into the project filament
@@ -355,6 +362,7 @@ paths:
                   slot:
                     type: integer
                     description: Filament only - the slot that was assigned.
+                  discarded_changes: { $ref: "#/components/schemas/DiscardedChanges" }
         "400":
           description: "`invalid_json`, `missing_fields`, `unknown_type` or `bad_param` (`slot`)."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -362,7 +370,7 @@ paths:
         "409":
           description: |
             `selection_fell_back` - the slicer selected a different preset, named
-            in `selected`.
+            in `selected`. Also carries `discarded_changes`.
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "422":
           description: |
@@ -371,7 +379,7 @@ paths:
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "504": { $ref: "#/components/responses/UiTimeout" }
         "500":
-          description: "`tab_unavailable` or `select_cancelled`, plus the generic `internal`."
+          description: "`tab_unavailable` or `select_cancelled` (which also carries `discarded_changes`), plus the generic `internal`."
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     delete:
       tags: [presets]
@@ -457,7 +465,11 @@ paths:
       operationId: getPresetConfig
       description: |
         Read-only. A POST rather than a GET so that preset names containing
-        spaces or "@" need no URL encoding.
+        spaces or "@" need no URL encoding. The printer connection's
+        credentials (`printhost_apikey`, `printhost_user`,
+        `printhost_password`) are returned as `<redacted>` when set, and a
+        `user:password@` inside `print_host` or `print_host_webui` is replaced
+        the same way.
       requestBody:
         required: true
         content:
@@ -624,7 +636,10 @@ paths:
       description: |
         A flat object of per-object settings, validated and applied atomically in
         the same way as PUT /config. Keys must exist in the print config
-        definition.
+        definition. A sensitive key (see PUT /config) is refused with
+        `blocked_by_remote_api_policy` unless `remote_api_allow_sensitive` is
+        on, with no write-back exemption. Setting `extruder` also updates the
+        object list's filament column.
       parameters:
         - $ref: "#/components/parameters/ObjectId"
       requestBody:
@@ -1408,6 +1423,12 @@ components:
         type: { type: string, enum: [print, filament, printer] }
         name: { type: string }
 
+    DiscardedChanges:
+      type: array
+      description: Preset groups whose unsaved changes the selection discarded.
+      items:
+        type: string
+        enum: [print, filament, sla_material, printer]
     PresetSelect:
       allOf:
         - $ref: "#/components/schemas/PresetRef"
@@ -1463,6 +1484,13 @@ components:
         capabilities:
           type: array
           items: { type: string }
+        sensitive_keys_allowed:
+          type: boolean
+          description: |
+            The Preferences toggle `remote_api_allow_sensitive`. Off by default;
+            while off, PUT /config refuses to change post-processing scripts,
+            slicing plugins, G-code templates, the printer connection,
+            `printer_model` and `filename_format`.
         project:     { type: string }
         current_plate: { type: integer }
         plate_count:   { type: integer }

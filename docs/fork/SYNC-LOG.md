@@ -117,8 +117,9 @@ Noted, not changed:
 - `a338f6ca7d` moved `auto_drop` from the build item to the object's metadata and stopped reading
   the old place; a missing attribute means on. A project saved before it with an object whose
   snapping was turned off opens with snapping on, and the next `changed_object` (any transform or
-  object-config route, or the GUI) drops the object to the bed. An upstream compatibility bug that
-  hits the GUI as well; none of the projects at hand use it.
+  object-config route, or the GUI) drops the object to the bed — on load, as it turned out. An
+  upstream compatibility bug that hits the GUI as well, reported as OrcaSlicer/OrcaSlicer#16624;
+  none of the projects at hand use it.
 - The same commit makes a GUI move bring all instances of an object to one Z, so a per-instance Z
   set through the transform route is undone by the next drag of a sibling.
 - Slice progress text is now `Slicing plate N: <step>` (was ` plate N:<step>`), as seen in
@@ -145,6 +146,11 @@ stats, the status after adding, selecting and moving between plates, a reused re
 `already_valid`, a straddling instance moved onto its target, duplicate, and a genuinely
 unsliceable plate still refused with its reason. The password redaction was not exercised live;
 it is his function verbatim, which he checked against his MCP's guard on 50,167 inputs.
+
+`scripts/run_clang_tidy.ps1` (with `-DepsDir depsuild-dbginfo`, since this tree is not the one
+`build_win.bat` makes) reported about a hundred `misc-include-cleaner` findings across the Remote
+API sources and `GUI_App.cpp`, all older than this sync. They were fixed in a separate commit; the
+check now passes on every file the fork changes.
 
 ---
 

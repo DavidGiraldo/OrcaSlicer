@@ -4,9 +4,11 @@
 
 #include "RemoteAPIServer.hpp"
 
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <set>
+#include <string>
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 

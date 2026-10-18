@@ -5,12 +5,13 @@
 #include "OrcaCloudServiceAgent.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
-// Boost.Asio-based RemoteAPI headers included BEFORE GUI_App.hpp (which pulls in
+// orca-mcp: Boost.Asio-based RemoteAPI headers included BEFORE GUI_App.hpp (which pulls in
 // wx/windows.h) to preserve asio-before-windows.h ordering, and to supply the
 // full RemoteAPI::Server/Controller definitions this TU needs (they are only
 // forward-declared in GUI_App.hpp).
 #include "RemoteAPI/RemoteAPIServer.hpp"
 #include "RemoteAPI/RemoteAPIController.hpp"
+#include "RemoteAPI/RemoteAPIConfig.hpp" // orca-mcp: RemoteAPI::Config::load in start_remote_api
 #include "GUI_App.hpp"
 #include "Shortcuts.hpp"
 #include "DeviceCore/DevConfigUtil.h"

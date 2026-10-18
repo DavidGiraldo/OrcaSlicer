@@ -5,6 +5,8 @@
 #include "RemoteAPIConfig.hpp"
 
 #include <boost/asio.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/websocket.hpp>
@@ -18,6 +20,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 

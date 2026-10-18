@@ -28,6 +28,13 @@
 #include "slic3r/GUI/GLCanvas3D.hpp"      // plate_render: offscreen thumbnail/gcode render
 #include "slic3r/GUI/Camera.hpp"          // plate_render: ViewAngleType
 #include "libslic3r/GCode/ThumbnailData.hpp" // plate_render: ThumbnailData/ThumbnailsParams
+#include "RemoteAPIServer.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/PrintBase.hpp"
+#include "libslic3r/libslic3r.h"
 #include <miniz.h>                        // plate_render: RGBA -> PNG in memory
 #include "libslic3r/FlushVolCalc.hpp"      // project scope: g_max_flush_volume bound
 #include "slic3r/GUI/WipeTowerDialog.hpp"  // project scope: is_flush_config_modified
@@ -37,16 +44,31 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <exception>
 #include <fstream>
+#include <functional>
 #include <future>
+#include <ios>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/operations.hpp>
+
+#include <wx/dataview.h>
+#include <wx/longlong.h>
+#include <wx/time.h>
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 

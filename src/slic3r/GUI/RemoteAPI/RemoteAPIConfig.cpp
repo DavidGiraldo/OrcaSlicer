@@ -7,6 +7,9 @@
 #include <boost/log/trivial.hpp>
 #include <openssl/rand.h>
 
+#include <cstddef>
+#include <string>
+
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
 
 Config Config::load()

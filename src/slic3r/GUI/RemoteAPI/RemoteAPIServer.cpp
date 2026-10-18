@@ -1,9 +1,34 @@
 // src/slic3r/GUI/RemoteAPI/RemoteAPIServer.cpp
 #include "RemoteAPIServer.hpp"
 
+#include "RemoteAPIConfig.hpp"
 #include "libslic3r/Thread.hpp"
+
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/address_v4.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/socket_base.hpp>
+#include <boost/beast/core/error.hpp>
+#include <boost/beast/core/role.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
+#include <boost/beast/http/field.hpp>
+#include <boost/beast/http/message.hpp>
+#include <boost/beast/http/status.hpp>
+#include <boost/beast/http/string_body.hpp>
+#include <boost/beast/websocket/stream.hpp>
+#include <boost/beast/websocket/stream_base.hpp>
 #include <boost/log/trivial.hpp>
+
+#include <chrono>
+#include <cstddef>
 #include <deque>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
 
 namespace beast = boost::beast;
 namespace http  = beast::http;

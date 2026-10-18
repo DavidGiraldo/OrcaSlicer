@@ -39,6 +39,9 @@ Settled questions, kept here so they are not argued again on the next sync.
   binary cannot pass the CLI suite upstream added on 2026-09-08. This fork rebases onto current
   `origin/main`, so cloning that repository's `HEAD` is exactly right, and a pin would freeze CI
   against a stale suite. `build_orca.yml` is byte-identical to upstream here.
+- **Refusing to move an object off a locked plate.** The canvas lets an object be dragged off a
+  locked plate; locking only keeps arrange and orient away from it, and the API already honours
+  that for both. Refusing the move would make the API stricter than the window.
 - **His CI changes for his own build matrix** — the Windows ARM64 CMake pins, `build_release_vs.bat`
   (upstream replaced that script with `build_win.bat`, which already fails on a CMake error) and the
   macOS ad-hoc signing step. This fork's workflows track upstream byte for byte and it ships no macOS
@@ -49,6 +52,99 @@ Settled questions, kept here so they are not argued again on the next sync.
 Triage covers `remote-api-port` **and** `remote-api-242`. Since 2026-10 his Remote API fixes land on
 `remote-api-242` (and its `fix/*` branches) and only some reach `remote-api-port`, so watching one
 branch misses them.
+
+---
+
+## 2026-10-18 — rebase onto upstream `06665d0558`
+
+Previous base `e4142db820` (2026-10-10). **474 upstream commits** absorbed, 165 of them on the
+first-parent line (most of the rest is the IDEX/IQEX parallel-printing branch); 58 fork commits
+replayed.
+
+### Conflicts
+
+None.
+
+### Dependencies
+
+Only libjpeg-turbo was rebuilt: 3.0.1 → 3.2.0 (`f6cf18fb96`). The CPython recipe change
+(`d5403ccc94`) pins the Python that runs CPython's own Windows build scripts and fetches its
+externals itself; the CPython version and hash are unchanged, so the existing build stays valid.
+
+### From MaxEllis
+
+Four new commits, all on `remote-api-242` (2026-10-12). None applied as-is; the controller changes
+were ported by hand.
+
+- **Taken — host passwords containing `/`** (`35f2590d2e`). `strip_url_userinfo` was identical
+  here, so `print_host = http://user:pa/ss@host` came back unredacted from `POST /preset/config`
+  and in the change notification. Everything between the scheme and the last `@` is now cut.
+- **Taken, adapted — moving an instance to another plate** (`fa3c9ee370`). The plate-list update
+  half was already here (2026-09-18). Taken: the position is kept relative to the old plate only
+  when the instance really lies on it, since the plate list can lag behind the geometry, and an
+  instance whose relative position would fall outside the target is centred on it instead. This
+  fork moves through `POST /objects/{id}/transform` with `plate`, not a separate route.
+- **Taken, adapted — `/slice/status` follows the current plate** (from `4078e34cac`, his version of
+  the plate routes this fork wrote separately). A `POST /slice` that found the plate already
+  sliced, or a plate add, duplicate, delete, select or move, left the snapshot on whichever plate
+  was sliced last, so a client reading stats after `already_valid` got another plate's. The
+  snapshot now describes the current plate (`done` with its stats, or `idle`), with a new
+  `slice.plate_changed` event. His refusal to move off a locked plate was not taken; see the
+  standing decisions.
+- **Skipped** — `ce6db4b62b`, his `ORCA_MCP_RELEASE` bump.
+
+### What the clean rebase was hiding
+
+**A G-code template outside the sensitive-key policy.** The parallel-printing work (`aa14598e32`)
+added `imex_mode_gcodes`, a printer key holding G-code injected before `machine_start_gcode`. The
+policy matched templates by the `_gcode` suffix, which `_gcodes` does not end in, so with only the
+token a client could set it (with `is_imex` and a mode) and have every export run arbitrary G-code.
+Keys ending in `_gcodes` are now templates too; it is the only plural template in the tree.
+
+**A new duty after moving instances.** The same commit made `GLCanvas3D::do_move` and its siblings
+drop the IDEX/IQEX copy and mirror previews, whose cache key ignores instance transforms. The
+transform and duplicate routes now do the same. Display only.
+
+**A fork defect, found while verifying.** `Plater::reslice` reuses a finished print it still holds
+by marking the plate valid itself, with no completion event; adding or switching plates marks a
+plate stale without changing its print, so this is the normal case after a plate route. The
+slice route took the missing event for a refusal and answered `422 slice_not_started` ("cannot be
+sliced in its current state") for a plate that was valid a moment later. It now answers
+`already_valid`. The reuse branch predates this sync.
+
+Noted, not changed:
+
+- `a338f6ca7d` moved `auto_drop` from the build item to the object's metadata and stopped reading
+  the old place; a missing attribute means on. A project saved before it with an object whose
+  snapping was turned off opens with snapping on, and the next `changed_object` (any transform or
+  object-config route, or the GUI) drops the object to the bed. An upstream compatibility bug that
+  hits the GUI as well; none of the projects at hand use it.
+- The same commit makes a GUI move bring all instances of an object to one Z, so a per-instance Z
+  set through the transform route is undone by the next drag of a sibling.
+- Slice progress text is now `Slicing plate N: <step>` (was ` plate N:<step>`), as seen in
+  `slice.progress` and the status `message`. Nothing here parses it.
+- An object overlapping an IDEX/IQEX zone makes `slice_not_started` report the generic `outside`
+  reason, and the parallel-printing advisories (bed temperature, filament type) are raised only by
+  the Slice button, so `POST /slice` does not surface them.
+- With Focus Mode on, `GET /plate/render?plate=N&frame=object` can frame the previous plate's
+  objects, because inactive plates are hidden only on the next frame.
+- The plugin host's `export_3mf_copy` (`de5f2cb3b9`) saves without the auto-backup gate, the same
+  as the GUI's own Save.
+
+Checked clean: no guard deleted on an API path, no new modal reachable from an API call (the new
+prime tower dialog lives in `Tab::on_value_change` only), no signature or key renames.
+
+### Result
+
+RelWithDebInfo builds cleanly. `ctest`: 2319 of 2321 pass. `Hollowed cube should be supported from
+the inside` fails as it did in the last entry. `FilamentGroup golden regression` failed only its
+throughput ceiling (32.6 s against 30 s, identical score) under a 12-way parallel run and passes
+alone. A live run passed every changed path: `imex_mode_gcodes` and `machine_start_gcode` refused,
+the `emit_machine_limits_to_gcode` toggle still writable, `already_valid` with the plate's own
+stats, the status after adding, selecting and moving between plates, a reused result reported as
+`already_valid`, a straddling instance moved onto its target, duplicate, and a genuinely
+unsliceable plate still refused with its reason. The password redaction was not exercised live;
+it is his function verbatim, which he checked against his MCP's guard on 50,167 inputs.
 
 ---
 

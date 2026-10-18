@@ -488,13 +488,12 @@ static std::string json_value_to_config_string(const nlohmann::json &v)
 // change and passes.
 static bool is_sensitive_config_key(const std::string &key)
 {
-    static const std::string gcode_suffix = "_gcode";
     if (key == "post_process" || key == "printer_model" || key == "filename_format" ||
         key == "slicing_pipeline_plugin" || key == "plugins" ||
         key.rfind("printhost_", 0) == 0)
         return true;
-    if (key.size() > gcode_suffix.size() &&
-        key.compare(key.size() - gcode_suffix.size(), gcode_suffix.size(), gcode_suffix) == 0)
+    // G-code templates, single ("machine_start_gcode") or one per entry ("imex_mode_gcodes").
+    if (boost::algorithm::ends_with(key, "_gcode") || boost::algorithm::ends_with(key, "_gcodes"))
         return key != "emit_machine_limits_to_gcode"; // a toggle, not a template
     if (boost::algorithm::ends_with(key, "_plugin_config_overrides"))
         return true;
@@ -525,17 +524,31 @@ static bool is_host_url_key(const std::string &key)
     return key == "print_host" || key == "print_host_webui";
 }
 
+// Length of a leading "scheme://", or 0. The scheme has to start the value and be
+// RFC 3986 letters (ASCII, whatever the locale), so in "user:pa://ss@host" the "user:pa"
+// is not mistaken for one.
+static size_t url_scheme_length(const std::string &url)
+{
+    const auto alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (url.empty() || !alpha(url[0]))
+        return 0;
+    size_t i = 1;
+    while (i < url.size() && (alpha(url[i]) || digit(url[i]) || url[i] == '+' || url[i] == '-' || url[i] == '.'))
+        ++i;
+    return url.compare(i, 3, "://") == 0 ? i + 3 : 0;
+}
+
+// Everything between the scheme and the LAST '@' is cut. A host never contains '@', while a
+// password may contain '@', '/', '?', '#' or spaces, so this hides all of them. A URL with an
+// '@' in its path loses the part before it too: it cannot be told apart from a password
+// containing '/', and over-redacting a rare URL is the safe way to be wrong.
 static std::string strip_url_userinfo(const std::string &url)
 {
-    // Only a "://" that ends the scheme counts, i.e. one that comes before any other '/'.
-    const size_t sep   = url.find("://");
-    const size_t start = (sep != std::string::npos && url.find('/') == sep + 1) ? sep + 3 : 0;
-    const size_t slash = url.find('/', start);
-    // The LAST '@' before the path, so a password containing '@' is covered too.
-    const size_t at    = url.rfind('@', slash);
-    if (at == std::string::npos || at < start)
+    const size_t at = url.rfind('@');
+    if (at == std::string::npos)
         return url;
-    return url.substr(0, start) + k_redacted + url.substr(at);
+    return url.substr(0, url_scheme_length(url)) + k_redacted + url.substr(at);
 }
 
 // GET /config reports the MERGED config, where every vector-valued filament key holds one
@@ -1068,6 +1081,120 @@ void Controller::set_slice_state(const std::function<void(SliceState&)> &mut, co
     wxGetApp().remote_api_server().broadcast(snapshot);
 }
 
+// GUI thread. Statistics and warnings of the current plate's slice result.
+static void current_plate_slice_stats(nlohmann::json &stats, nlohmann::json &warnings)
+{
+    warnings = nlohmann::json::array();
+    auto &plates = wxGetApp().plater()->get_partplate_list();
+    const PrintStatistics &ps = plates.get_current_fff_print().print_statistics();
+    stats = {
+        {"estimated_time", ps.estimated_normal_print_time},
+        {"filament_used_mm", ps.total_used_filament},
+        {"filament_used_g", ps.total_weight},
+        {"total_cost", ps.total_cost}
+    };
+    if (GCodeProcessorResult *res = plates.get_curr_plate()->get_slice_result()) {
+        if (!res->print_statistics.modes.empty())
+            stats["estimated_time_seconds"] = res->print_statistics.modes.front().time;
+        for (const auto &w : res->warnings)
+            warnings.push_back({{"level", w.level}, {"message", w.msg}, {"code", w.error_code}});
+        // The "toolpath goes beyond the plate boundaries" warning is a GUI plater
+        // notification (GLCanvas3D), computed from the gcode viewer's bed-containment
+        // check - so it never reaches res->warnings and was invisible to the API.
+        // Recompute it here from the same data the viewer uses (BuildVolume::
+        // all_paths_inside over the extrude moves) and surface it in warnings[].
+        BoundingBoxf3 paths_bbox;
+        bool any_path = false;
+        for (const auto &mv : res->moves) {
+            if (mv.type == EMoveType::Extrude && mv.extrusion_role != erCustom &&
+                mv.width != 0.f && mv.height != 0.f) {
+                paths_bbox.merge(mv.position.cast<double>());
+                any_path = true;
+            }
+        }
+        if (any_path && !wxGetApp().plater()->build_volume().all_paths_inside(*res, paths_bbox))
+            warnings.push_back({{"level", 3},
+                                {"message", "A G-code path goes beyond the plate boundaries."},
+                                {"code", "TOOLPATH_OUTSIDE"}});
+
+        // F14: per-feature (extrusion-role) breakdown for the slice-analytics MCP.
+        // PrintEstimatedStatistics has no per-role TIME, so sum it per role from the
+        // moves (Normal mode, index 0 - matches estimated_time_seconds). Filament comes
+        // from used_filaments_per_role; flow is the COMMANDED volumetric rate
+        // (feedrate * mm3_per_mm), the right basis for detecting flow-ceiling clamping.
+        // Role keys are STABLE Orca config-feature tokens (NOT localized role_to_string)
+        // so the MCP predicted_flows keys match by string - see the fork-breakdown plan.
+        auto role_token = [](int r) -> const char* {
+            switch (r) {
+                case erExternalPerimeter:        return "outer_wall";
+                case erPerimeter:                return "inner_wall";
+                case erInternalInfill:           return "sparse_infill";
+                case erSolidInfill:              return "internal_solid_infill";
+                case erTopSolidInfill:           return "top_surface";
+                case erGapFill:                  return "gap_infill";
+                case erBridgeInfill:             return "bridge";
+                case erOverhangPerimeter:        return "overhang_perimeter";
+                case erBottomSurface:            return "bottom_surface";
+                case erIroning:                  return "ironing";
+                case erInternalBridgeInfill:     return "internal_bridge";
+                case erSkirt:                    return "skirt";
+                case erBrim:                     return "brim";
+                case erSupportMaterial:          return "support";
+                case erSupportMaterialInterface: return "support_interface";
+                case erSupportTransition:        return "support_transition";
+                case erWipeTower:                return "wipe_tower";
+                case erCustom:                   return "custom";
+                case erMixed:                    return "mixed";
+                default:                         return nullptr; // erNone / erCount
+            }
+        };
+        struct RoleAgg { double time_s = 0.0, max_flow = 0.0, sum_ft = 0.0; };
+        RoleAgg agg[erCount];
+        for (const auto &mv : res->moves) {
+            if (mv.type != EMoveType::Extrude) continue;
+            int r = (int) mv.extrusion_role;
+            if (r <= 0 || r >= erCount) continue;
+            double t = mv.time[0];
+            double vr = mv.volumetric_rate(); // feedrate * mm3_per_mm
+            agg[r].time_s += t;
+            agg[r].sum_ft += vr * t;
+            if (vr > agg[r].max_flow) agg[r].max_flow = vr;
+        }
+        double total_time = res->print_statistics.modes.empty() ? 0.0
+                            : (double) res->print_statistics.modes.front().time;
+        const auto &fpr = res->print_statistics.used_filaments_per_role;
+        nlohmann::json roles = nlohmann::json::array();
+        for (int r = 1; r < erCount; ++r) {
+            const char *tok = role_token(r);
+            if (tok == nullptr) continue;
+            auto it = fpr.find((ExtrusionRole) r);
+            bool has_fil = (it != fpr.end());
+            if (agg[r].time_s <= 0.0 && !has_fil) continue;
+            nlohmann::json role_j = {
+                {"role", tok},
+                {"time_s", agg[r].time_s},
+                {"time_pct", total_time > 0.0 ? 100.0 * agg[r].time_s / total_time : 0.0},
+                {"flow_mm3_s", {{"max", agg[r].max_flow},
+                                {"mean", agg[r].time_s > 0.0 ? agg[r].sum_ft / agg[r].time_s : 0.0}}}
+            };
+            if (has_fil) {
+                // used_filaments_per_role.first is METERS (GUI convention); emit mm to
+                // match top-level filament_used_mm. .second is grams.
+                role_j["filament_mm"] = it->second.first * 1000.0;
+                role_j["filament_g"]  = it->second.second;
+            }
+            roles.push_back(role_j);
+        }
+        stats["breakdown"] = {
+            {"mode", "normal"},
+            {"total_time_s", total_time},
+            {"roles", roles},
+            {"metrics", nlohmann::json::object()},
+            {"layers", nlohmann::json::array()}
+        };
+    }
+}
+
 // Tracks which Plater the slice events are bound to. A GUI recreate (language/
 // skin switch) builds a NEW Plater and the old Bind()s die with it, so we must
 // rebind onto the new plater. File-static (only one Controller ever exists)
@@ -1110,121 +1237,39 @@ void Controller::bind_plater_events()
             return;
         }
         // Success: harvest stats on the GUI thread (we ARE on it - wx handler).
-        nlohmann::json stats, warnings = nlohmann::json::array();
-        auto &plates = wxGetApp().plater()->get_partplate_list();
-        const PrintStatistics &ps = plates.get_current_fff_print().print_statistics();
-        stats = {
-            {"estimated_time", ps.estimated_normal_print_time},
-            {"filament_used_mm", ps.total_used_filament},
-            {"filament_used_g", ps.total_weight},
-            {"total_cost", ps.total_cost}
-        };
-        if (GCodeProcessorResult *res = plates.get_curr_plate()->get_slice_result()) {
-            if (!res->print_statistics.modes.empty())
-                stats["estimated_time_seconds"] = res->print_statistics.modes.front().time;
-            for (const auto &w : res->warnings)
-                warnings.push_back({{"level", w.level}, {"message", w.msg}, {"code", w.error_code}});
-            // The "toolpath goes beyond the plate boundaries" warning is a GUI plater
-            // notification (GLCanvas3D), computed from the gcode viewer's bed-containment
-            // check - so it never reaches res->warnings and was invisible to the API.
-            // Recompute it here from the same data the viewer uses (BuildVolume::
-            // all_paths_inside over the extrude moves) and surface it in warnings[].
-            BoundingBoxf3 paths_bbox;
-            bool any_path = false;
-            for (const auto &mv : res->moves) {
-                if (mv.type == EMoveType::Extrude && mv.extrusion_role != erCustom &&
-                    mv.width != 0.f && mv.height != 0.f) {
-                    paths_bbox.merge(mv.position.cast<double>());
-                    any_path = true;
-                }
-            }
-            if (any_path && !wxGetApp().plater()->build_volume().all_paths_inside(*res, paths_bbox))
-                warnings.push_back({{"level", 3},
-                                    {"message", "A G-code path goes beyond the plate boundaries."},
-                                    {"code", "TOOLPATH_OUTSIDE"}});
-
-            // F14: per-feature (extrusion-role) breakdown for the slice-analytics MCP.
-            // PrintEstimatedStatistics has no per-role TIME, so sum it per role from the
-            // moves (Normal mode, index 0 - matches estimated_time_seconds). Filament comes
-            // from used_filaments_per_role; flow is the COMMANDED volumetric rate
-            // (feedrate * mm3_per_mm), the right basis for detecting flow-ceiling clamping.
-            // Role keys are STABLE Orca config-feature tokens (NOT localized role_to_string)
-            // so the MCP predicted_flows keys match by string - see the fork-breakdown plan.
-            auto role_token = [](int r) -> const char* {
-                switch (r) {
-                    case erExternalPerimeter:        return "outer_wall";
-                    case erPerimeter:                return "inner_wall";
-                    case erInternalInfill:           return "sparse_infill";
-                    case erSolidInfill:              return "internal_solid_infill";
-                    case erTopSolidInfill:           return "top_surface";
-                    case erGapFill:                  return "gap_infill";
-                    case erBridgeInfill:             return "bridge";
-                    case erOverhangPerimeter:        return "overhang_perimeter";
-                    case erBottomSurface:            return "bottom_surface";
-                    case erIroning:                  return "ironing";
-                    case erInternalBridgeInfill:     return "internal_bridge";
-                    case erSkirt:                    return "skirt";
-                    case erBrim:                     return "brim";
-                    case erSupportMaterial:          return "support";
-                    case erSupportMaterialInterface: return "support_interface";
-                    case erSupportTransition:        return "support_transition";
-                    case erWipeTower:                return "wipe_tower";
-                    case erCustom:                   return "custom";
-                    case erMixed:                    return "mixed";
-                    default:                         return nullptr; // erNone / erCount
-                }
-            };
-            struct RoleAgg { double time_s = 0.0, max_flow = 0.0, sum_ft = 0.0; };
-            RoleAgg agg[erCount];
-            for (const auto &mv : res->moves) {
-                if (mv.type != EMoveType::Extrude) continue;
-                int r = (int) mv.extrusion_role;
-                if (r <= 0 || r >= erCount) continue;
-                double t = mv.time[0];
-                double vr = mv.volumetric_rate(); // feedrate * mm3_per_mm
-                agg[r].time_s += t;
-                agg[r].sum_ft += vr * t;
-                if (vr > agg[r].max_flow) agg[r].max_flow = vr;
-            }
-            double total_time = res->print_statistics.modes.empty() ? 0.0
-                                : (double) res->print_statistics.modes.front().time;
-            const auto &fpr = res->print_statistics.used_filaments_per_role;
-            nlohmann::json roles = nlohmann::json::array();
-            for (int r = 1; r < erCount; ++r) {
-                const char *tok = role_token(r);
-                if (tok == nullptr) continue;
-                auto it = fpr.find((ExtrusionRole) r);
-                bool has_fil = (it != fpr.end());
-                if (agg[r].time_s <= 0.0 && !has_fil) continue;
-                nlohmann::json role_j = {
-                    {"role", tok},
-                    {"time_s", agg[r].time_s},
-                    {"time_pct", total_time > 0.0 ? 100.0 * agg[r].time_s / total_time : 0.0},
-                    {"flow_mm3_s", {{"max", agg[r].max_flow},
-                                    {"mean", agg[r].time_s > 0.0 ? agg[r].sum_ft / agg[r].time_s : 0.0}}}
-                };
-                if (has_fil) {
-                    // used_filaments_per_role.first is METERS (GUI convention); emit mm to
-                    // match top-level filament_used_mm. .second is grams.
-                    role_j["filament_mm"] = it->second.first * 1000.0;
-                    role_j["filament_g"]  = it->second.second;
-                }
-                roles.push_back(role_j);
-            }
-            stats["breakdown"] = {
-                {"mode", "normal"},
-                {"total_time_s", total_time},
-                {"roles", roles},
-                {"metrics", nlohmann::json::object()},
-                {"layers", nlohmann::json::array()}
-            };
-        }
+        nlohmann::json stats, warnings;
+        current_plate_slice_stats(stats, warnings);
         set_slice_state([&](SliceState &s) {
             s.state = "done"; s.percent = 100; s.message = "";
             s.stats = stats; s.warnings = warnings;
-            s.plate = plates.get_curr_plate_index();
+            s.plate = wxGetApp().plater()->get_partplate_list().get_curr_plate_index();
         }, "slice.done");
     });
+}
+
+// GUI thread. Makes the slice snapshot describe the current plate: its own result when it holds a
+// valid one, otherwise idle. Without it, a POST /slice that finds the plate already sliced, or a
+// plate switch, would leave /slice/status reporting whichever plate was sliced last.
+void Controller::sync_slice_state_to_current_plate(const char *event_name)
+{
+    // The slicer's own flag, not the snapshot: handle_slice sets "slicing" before reslice(), which
+    // may then reuse the previous result without starting anything.
+    if (wxGetApp().plater()->is_background_process_slicing()) return;
+    PartPlateList &plates = wxGetApp().plater()->get_partplate_list();
+    const int      curr   = plates.get_curr_plate_index();
+    if (plates.get_curr_plate()->is_slice_result_valid()) {
+        nlohmann::json stats, warnings;
+        current_plate_slice_stats(stats, warnings);
+        set_slice_state([&](SliceState &s) {
+            s.state = "done"; s.percent = 100; s.message = "";
+            s.stats = stats; s.warnings = warnings; s.plate = curr;
+        }, event_name);
+    } else {
+        set_slice_state([&](SliceState &s) {
+            s.state = "idle"; s.percent = -1; s.message = "plate " + std::to_string(curr + 1) + " is not sliced";
+            s.stats = nullptr; s.warnings = nlohmann::json::array(); s.plate = curr;
+        }, event_name);
+    }
 }
 
 // GUI thread. Why the current plate cannot be sliced, found the way the Slice button finds it
@@ -1283,8 +1328,10 @@ Response Controller::handle_slice(const std::string &target)
         plater->update(false, /*force_background_processing_update=*/true);
         // reslice() no-ops on an already-valid plate -> no completion event ->
         // status would stick at "slicing". Report the existing result instead.
-        if (plater->get_partplate_list().get_curr_plate()->is_slice_result_valid())
+        if (plater->get_partplate_list().get_curr_plate()->is_slice_result_valid()) {
+            sync_slice_state_to_current_plate("slice.done");
             return {{"started", false}, {"already_valid", true}, {"plate", curr}};
+        }
         set_slice_state([curr](SliceState &s) {
             s.state = "slicing"; s.percent = 0; s.message = "starting";
             s.stats = nullptr; s.warnings = nlohmann::json::array();
@@ -1298,6 +1345,13 @@ Response Controller::handle_slice(const std::string &target)
         // is false here nothing is coming and the state would wedge at
         // "slicing" forever. Flip it to error instead.
         if (!plater->is_background_process_slicing()) {
+            // Not a failure when reslice() found the print already finished and reused that result
+            // (it marks the plate valid itself, with no event). A plate add or switch leaves a plate
+            // marked stale while its print still holds the finished result.
+            if (plater->get_partplate_list().get_curr_plate()->is_slice_result_valid()) {
+                sync_slice_state_to_current_plate("slice.done");
+                return {{"started", false}, {"already_valid", true}, {"plate", curr}};
+            }
             nlohmann::json why = slice_block_reason(plater);
             const std::string message = why["message"].get<std::string>();
             set_slice_state([&message, curr](SliceState &s) {
@@ -2106,19 +2160,28 @@ Response Controller::handle_transform_object(uint64_t id, const std::string &bod
         if (target_plate >= plates.get_plate_count())
             return {{"error", "unknown_plate"}, {"count", plates.get_plate_count()}};
         ModelInstance *mi = mo->instances[instance];
-        if (target_plate >= 0) {
-            // Keep the instance where it sits relative to its plate, as dragging it across would;
-            // one on no plate is centred on the target instead.
-            PartPlate  *target = plates.get_plate(target_plate);
-            const int   source = plates.find_instance(idx, instance);
+        PartPlate     *target = target_plate >= 0 ? plates.get_plate(target_plate) : nullptr;
+        auto centre_on_target = [&]() {
+            const BoundingBoxf3 bed = target->get_build_volume();
+            const BoundingBoxf3 bb  = mo->instance_bounding_box(instance, false);
+            const Vec3d shift = bed.center() - bb.center();
+            mi->set_offset(mi->get_offset() + Vec3d(shift.x(), shift.y(), 0.0));
+        };
+        if (target != nullptr) {
+            // Keep the instance where it sits relative to its plate, as dragging it across would,
+            // but only when it really lies on that plate: the plate list can lag behind the
+            // geometry. Otherwise it is centred on the target.
+            const int source = plates.find_instance(idx, instance);
+            bool relative = false;
             if (source >= 0) {
-                mi->set_offset(mi->get_offset() - plates.get_plate(source)->get_origin() + target->get_origin());
-            } else {
-                const BoundingBoxf3 bed = target->get_build_volume();
-                const BoundingBoxf3 bb  = mo->instance_bounding_box(instance, false);
-                const Vec3d shift = bed.center() - bb.center();
-                mi->set_offset(mi->get_offset() + Vec3d(shift.x(), shift.y(), 0.0));
+                const BoundingBoxf3 sb = plates.get_plate(source)->get_build_volume();
+                const Vec3d o = mi->get_offset();
+                relative = o.x() >= sb.min.x() && o.x() <= sb.max.x() && o.y() >= sb.min.y() && o.y() <= sb.max.y();
             }
+            if (relative)
+                mi->set_offset(mi->get_offset() - plates.get_plate(source)->get_origin() + target->get_origin());
+            else
+                centre_on_target();
         }
         if (has_t) mi->set_offset(mi->get_offset() + tr);
         if (has_r) mi->set_rotation(mi->get_rotation() + ro * 0.017453292519943295); // deg->rad
@@ -2127,7 +2190,17 @@ Response Controller::handle_transform_object(uint64_t id, const std::string &bod
         // list the way upstream's own move path does. is_new=true applies a spiral-vase plate's
         // object settings without the confirmation dialog the GUI would show.
         plates.notify_instance_update(idx, instance, /*is_new=*/true);
+        if (target != nullptr && !has_t && plates.find_instance(idx, instance) != target_plate) {
+            // The relative position left it outside the target (it straddled the old plate's
+            // edge), so centre it there instead. An explicit translate is the caller's own choice.
+            centre_on_target();
+            plates.notify_instance_update(idx, instance, /*is_new=*/true);
+        }
+        // The IDEX/IQEX copy and mirror previews are cached without the instance transforms, so a
+        // move must drop them, as GLCanvas3D::do_move and its siblings do.
+        plates.invalidate_all_imex_ghosts();
         plater->changed_object(idx);
+        if (target != nullptr) sync_slice_state_to_current_plate("slice.plate_changed");
         api_notify(std::string(target_plate >= 0 ? "Moved to plate " + std::to_string(target_plate + 1) + ":"
                                : has_t ? "Moved" : (has_r ? "Rotated" : "Resized")) + " '" + mo->name + "'");
         auto off = mi->get_offset(); auto rot = mi->get_rotation(); auto scl = mi->get_scaling_factor();
@@ -2158,6 +2231,7 @@ Response Controller::handle_duplicate_object(uint64_t id)
         // registry. changed_object() does not touch it, so do it here too - otherwise a
         // duplicate is saved on no plate and gets no prime tower.
         plater->get_partplate_list().notify_instance_update(idx, (int) mo->instances.size() - 1, /*is_new=*/true);
+        plater->get_partplate_list().invalidate_all_imex_ghosts(); // see handle_transform_object
         plater->changed_object(idx);
         api_notify("Duplicated '" + mo->name + "'");
         return {{"duplicated", true}, {"id", id}, {"instances", (unsigned) mo->instances.size()}};
@@ -2338,7 +2412,7 @@ Response Controller::handle_add_plate(const std::string &body)
     nlohmann::json in = body.empty() ? nlohmann::json::object() : nlohmann::json::parse(body);
     if (!in.is_object()) return { 400, {{"error", "body_must_be_object"}} };
     if (in.contains("name") && !in["name"].is_string()) return { 400, {{"error", "bad_param"}, {"param", "name"}} };
-    nlohmann::json r = run_on_ui([in]() -> nlohmann::json {
+    nlohmann::json r = run_on_ui([this, in]() -> nlohmann::json {
         Plater *plater = wxGetApp().plater();
         if (plate_switch_blocked(plater)) return {{"error", "busy_slicing"}};
         if (!plater->can_add_plate()) return {{"error", "cannot_add_plate"}};
@@ -2349,6 +2423,7 @@ Response Controller::handle_add_plate(const std::string &body)
             wxGetApp().obj_list()->reload_all_plates();
         }
         api_notify("Added plate " + std::to_string(index + 1));
+        sync_slice_state_to_current_plate("slice.plate_changed");
         return plate_json(plater, index);
     });
     if (r.contains("error")) return plate_error(r);
@@ -2357,7 +2432,7 @@ Response Controller::handle_add_plate(const std::string &body)
 
 Response Controller::handle_duplicate_plate(int index)
 {
-    nlohmann::json r = run_on_ui([index]() -> nlohmann::json {
+    nlohmann::json r = run_on_ui([this, index]() -> nlohmann::json {
         Plater        *plater = wxGetApp().plater();
         PartPlateList &plates = plater->get_partplate_list();
         if (index < 0 || index >= plates.get_plate_count()) return {{"error", "unknown_plate"}};
@@ -2365,6 +2440,7 @@ Response Controller::handle_duplicate_plate(int index)
         const int copy = plater->duplicate_plate(index);
         if (copy < 0) return {{"error", "cannot_add_plate"}};
         api_notify("Duplicated plate " + std::to_string(index + 1));
+        sync_slice_state_to_current_plate("slice.plate_changed");
         return plate_json(plater, copy);
     });
     if (r.contains("error")) return plate_error(r);
@@ -2373,7 +2449,7 @@ Response Controller::handle_duplicate_plate(int index)
 
 Response Controller::handle_delete_plate(int index, bool force)
 {
-    nlohmann::json r = run_on_ui([index, force]() -> nlohmann::json {
+    nlohmann::json r = run_on_ui([this, index, force]() -> nlohmann::json {
         Plater        *plater = wxGetApp().plater();
         PartPlateList &plates = plater->get_partplate_list();
         if (index < 0 || index >= plates.get_plate_count()) return {{"error", "unknown_plate"}};
@@ -2385,6 +2461,7 @@ Response Controller::handle_delete_plate(int index, bool force)
         if (!on_plate.empty() && !force) return {{"error", "plate_not_empty"}, {"objects", on_plate}};
         if (plater->delete_plate(index) < 0) return {{"error", "delete_failed"}};
         api_notify("Deleted plate " + std::to_string(index + 1));
+        sync_slice_state_to_current_plate("slice.plate_changed");
         return {{"deleted", index}, {"moved_objects", on_plate}, {"count", plates.get_plate_count()},
                 {"current", plates.get_curr_plate_index()}};
     });
@@ -2394,13 +2471,14 @@ Response Controller::handle_delete_plate(int index, bool force)
 
 Response Controller::handle_select_plate(int index)
 {
-    nlohmann::json r = run_on_ui([index]() -> nlohmann::json {
+    nlohmann::json r = run_on_ui([this, index]() -> nlohmann::json {
         Plater        *plater = wxGetApp().plater();
         PartPlateList &plates = plater->get_partplate_list();
         if (index < 0 || index >= plates.get_plate_count()) return {{"error", "unknown_plate"}};
         if (index != plates.get_curr_plate_index()) {
             if (plate_switch_blocked(plater)) return {{"error", "busy_slicing"}};
             if (plater->select_plate(index) != 0) return {{"error", "select_failed"}};
+            sync_slice_state_to_current_plate("slice.plate_changed");
         }
         return plate_json(plater, index);
     });

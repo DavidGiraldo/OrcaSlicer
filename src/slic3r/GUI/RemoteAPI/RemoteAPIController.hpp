@@ -88,6 +88,8 @@ private:
 
     // Mutate m_slice under the lock and broadcast a snapshot (event_name) to WS clients.
     void set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name);
+    // GUI thread. Points the snapshot at the current plate: done with its stats, or idle.
+    void sync_slice_state_to_current_plate(const char *event_name);
 
     // Debounced config.changed emitter (GUI thread; mutex guards the pending set).
     void on_config_changed(int preset_type);

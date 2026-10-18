@@ -182,8 +182,8 @@ unless **Allow script, G-code and connection edits** is ticked in Preferences â†
 
 - `post_process`, which runs programs on this computer, and the Python slicing plugins
   (`slicing_pipeline_plugin`, `plugins`, `*_plugin_config_overrides`);
-- every G-code template, any key ending in `_gcode` except the `emit_machine_limits_to_gcode`
-  toggle;
+- every G-code template, any key ending in `_gcode` or `_gcodes` (such as `imex_mode_gcodes`)
+  except the `emit_machine_limits_to_gcode` toggle;
 - the printer connection: `print_host`, `print_host_webui`, `host_type`, `printer_agent`, every
   `printhost_*` key and the other physical-printer options;
 - `printer_model` and `filename_format`.
@@ -235,7 +235,9 @@ the fallback.
 `?plate=N` slices plate N; every response carries the `plate` it acted on.
 
 `202` when slicing begins. `200` with `{"started": false, "already_valid": true}` when the plate
-already holds a valid result. `409 already_slicing` (also while a slice started from the window
+already holds a valid result, including one the slicer reuses because the plate's print never
+changed (adding or switching plates can mark a plate stale without changing it); `GET
+/slice/status` then reports that plate's own result. `409 already_slicing` (also while a slice started from the window
 runs, and for the moment after a cancel until the slicer has wound the old one down),
 `409 busy_slicing`, `404 unknown_plate`, `422 nothing_to_slice`, or `422 slice_not_started` when
 the plate cannot be sliced.
@@ -271,6 +273,11 @@ Reads a snapshot without touching the GUI thread, so it never times out.
 
 `state` is `idle`, `slicing`, `done` or `error`. `plate` is the plate the slice ran on, `-1`
 before any. `stats` appears only after a successful slice.
+
+A route that changes the current plate (adding, duplicating, deleting or selecting a plate, or
+moving an object to a plate) points the snapshot at the current plate: `done` with its stats when it
+holds a valid result, otherwise `idle` with `message` `plate N is not sliced`. A slice in progress
+is left alone.
 `breakdown` is emitted both inside `stats` and mirrored at the top level.
 
 The breakdown carries `mode`, `total_time_s` and a `roles` array, each entry with `role`,
@@ -421,7 +428,7 @@ At least one of `plate`, `translate`, `rotate` or `scale`:
 | Field | Units | Semantics |
 | --- | --- | --- |
 | `instance` | index | which instance, from 0; default `0` |
-| `plate` | index | **moves** the instance to that plate, keeping its position relative to the plate; one on no plate is centred on it |
+| `plate` | index | **moves** the instance to that plate, keeping its position relative to the plate it lies on; one that lies on no plate, or whose relative position would fall outside the target, is centred on it |
 | `translate` | mm | **relative**, added to the current offset, after any `plate` move |
 | `rotate` | degrees | **relative**, added to the current rotation |
 | `scale` | factor | **absolute**, replaces the current scale |
@@ -673,6 +680,7 @@ discriminator is **`event`**.
 | `slice.done` | snapshot with `percent` 100 and `stats` |
 | `slice.error` | snapshot with `state` `error` and the error in `message` |
 | `slice.cancelled` | snapshot with `state` `idle` and `message` `cancelled` |
+| `slice.plate_changed` | snapshot of the new current plate after a plate route: `done` with `stats`, or `idle` |
 
 A slice snapshot carries `event`, `state`, `percent`, `message`, `plate` and, when a slice
 succeeded, `stats`. It does not carry `warnings`; read those from `GET /slice/status`.

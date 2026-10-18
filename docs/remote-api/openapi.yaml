@@ -180,7 +180,9 @@ paths:
         - $ref: "#/components/parameters/PlateQuery"
       responses:
         "200":
-          description: The plate already holds a valid slice result; nothing started.
+          description: >-
+            The plate already holds a valid slice result, or the slicer reused the
+            finished result of a plate whose print never changed; nothing started.
           content:
             application/json:
               schema:
@@ -226,6 +228,12 @@ paths:
       description: |
         Reads a mutex-guarded snapshot without touching the GUI thread, so this
         endpoint never returns 504.
+
+        A route that changes the current plate (adding, duplicating, deleting or
+        selecting a plate, or moving an object to a plate) and a POST /slice that
+        finds the plate already sliced point the snapshot at the current plate:
+        done with its stats when it holds a valid result, otherwise idle with
+        message `plate N is not sliced`. A slice in progress is left alone.
       responses:
         "200":
           description: Current slice snapshot.
@@ -559,7 +567,8 @@ paths:
         `instance`, default 0.
 
         plate moves the instance to that plate, keeping its position relative to
-        the plate (one on no plate is centred on it). translate is then a relative
+        the plate it lies on (one that lies on no plate, or whose relative position
+        would fall outside the target, is centred on it). translate is then a relative
         delta in mm, rotate a relative delta in degrees, and scale an absolute
         factor that replaces the current one. The echoed rotation is in radians.
       parameters:
@@ -1240,7 +1249,8 @@ paths:
         (carries `tabs`, the coalesced set of print, filament, printer,
         sla_print, sla_material and other, debounced by one event-loop turn), and
         the slice snapshots `slice.started`, `slice.progress`, `slice.done`,
-        `slice.error` and `slice.cancelled`.
+        `slice.error`, `slice.cancelled` and `slice.plate_changed` (the new current
+        plate after a plate route).
 
         A slice snapshot carries `event`, `state`, `percent`, `message`, `plate`
         and, when a slice succeeded, `stats`. It does not carry `warnings`; read those from

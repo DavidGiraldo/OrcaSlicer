@@ -7,6 +7,7 @@
 #include "libslic3r_version.h"
 
 #include <boost/filesystem/path.hpp>
+#include <string> // orca-mcp: camera_host()
 #include <utility>
 #include <wx/panel.h>
 #include <wx/gdicmn.h>
@@ -21,6 +22,12 @@
 
 #include <slic3r/GUI/Widgets/WebView.hpp>
 #include <slic3r/GUI/Widgets/WebViewHostDialog.hpp>
+// orca-mcp: the camera icon and dialog
+#include "PrinterCameraDialog.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "slic3r/Utils/Http.hpp"
 #include "I18N.hpp"
 #include <nlohmann/json.hpp>
 #include <wx/utils.h>
@@ -121,6 +128,79 @@ static void add_page_strings(wxWebView *webView)
     webView->AddUserScript(wxString::FromUTF8(WebViewHostDialog::localized_strings_script(strings)));
 }
 
+// orca-mcp: the host of the selected printer's camera, or empty when PrinterCameraDialog cannot show it.
+// Only Creality's print host (K-series firmware) serves the WebRTC camera the dialog speaks.
+static std::string camera_host()
+{
+    const DynamicPrintConfig& config    = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    const auto*               host_type = config.option<ConfigOptionEnum<PrintHostType>>("host_type");
+    if (host_type == nullptr || host_type->value != htCrealityPrint)
+        return {};
+    const std::string print_host = config.opt_string("print_host");
+    return print_host.empty() ? std::string() : Http::get_host_from_url(print_host);
+}
+
+// orca-mcp: the message the camera icon posts to open PrinterCameraDialog.
+static const char* const k_open_camera_command = "orca_open_camera";
+
+// orca-mcp: adds a Camera icon to the printer's page that asks Orca to open PrinterCameraDialog. It goes
+// at the end of Fluidd's navigation rail, cloned from the last item so it takes Fluidd's look; a page
+// without that rail (Mainsail, a custom UI) gets a floating button instead. The observer puts the icon
+// back whenever Fluidd re-renders the rail.
+static wxString camera_icon_script()
+{
+    static const char* const body = R"JS(
+(function () {
+  if (window.__orcaCameraIcon) return;
+  window.__orcaCameraIcon = true;
+  const ID = "orca-camera-icon";
+  // Material Design Icons "camera", the set Fluidd draws its rail with.
+  const PATH = "M4,4H7L9,2H15L17,4H20A2,2 0 0,1 22,6V18A2,2 0 0,1 20,20H4A2,2 0 0,1 2,18V6A2,2 0 0,1 4,4M12,7A5,5 0 0,0 7,12A5,5 0 0,0 12,17A5,5 0 0,0 17,12A5,5 0 0,0 12,7M12,9A3,3 0 0,1 15,12A3,3 0 0,1 12,15A3,3 0 0,1 9,12A3,3 0 0,1 12,9Z";
+  function open(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    window.wx.postMessage(JSON.stringify({ command: COMMAND }));
+  }
+  function addToRail() {
+    const rail = document.querySelector(".v-navigation-drawer .nav-items");
+    const items = rail ? rail.querySelectorAll("a.v-list-item") : [];
+    if (!items.length) return false;
+    const icon = items[items.length - 1].cloneNode(true);
+    icon.id = ID;
+    icon.setAttribute("href", "#");
+    icon.removeAttribute("aria-haspopup");
+    icon.removeAttribute("aria-expanded");
+    [...icon.classList].filter((c) => c.endsWith("--active") || c.startsWith("router-link")).forEach((c) => icon.classList.remove(c));
+    icon.title = TITLE;
+    const path = icon.querySelector("svg path");
+    if (path) path.setAttribute("d", PATH);
+    const label = icon.querySelector(".v-list-item__title");
+    if (label) label.textContent = TITLE;
+    icon.addEventListener("click", open);
+    rail.appendChild(icon);
+    return true;
+  }
+  function addFloating() {
+    const button = document.createElement("button");
+    button.id = ID;
+    button.title = TITLE;
+    button.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:10000;width:40px;height:40px;border:none;" +
+      "border-radius:50%;background:#009688;cursor:pointer;display:flex;align-items:center;justify-content:center";
+    button.innerHTML = `<svg viewBox="0 0 24 24" width="22" height="22"><path fill="#fff" d="${PATH}"/></svg>`;
+    button.addEventListener("click", open);
+    document.body.appendChild(button);
+  }
+  const ensure = () => document.getElementById(ID) || addToRail();
+  new MutationObserver(ensure).observe(document.documentElement, { childList: true, subtree: true });
+  ensure();
+  setTimeout(() => document.getElementById(ID) || addFloating(), 5000);
+})();
+)JS";
+    // TRN Tooltip of the icon added to the printer's web page that opens its camera.
+    return wxString::FromUTF8("(function () { const TITLE = " + nlohmann::json(_u8L("Camera")).dump() +
+                              "; const COMMAND = " + nlohmann::json(k_open_camera_command).dump() + ";" + body + "})();");
+}
+
 PrinterWebView::PrinterWebView(wxWindow *parent)
         : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize)
     , m_browser(nullptr)
@@ -161,6 +241,9 @@ PrinterWebView::~PrinterWebView()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " Start";
     SetEvtHandlerEnabled(false);
     m_handler.reset();
+    // orca-mcp: the camera dialog is a top-level window, so it would outlive this panel.
+    if (m_camera_dialog)
+        m_camera_dialog->Destroy();
 
     // Destroy the webview
     if(m_browser){
@@ -224,6 +307,26 @@ void PrinterWebView::load_url(wxString& url, wxString apikey)
     }
     //m_browser->SetFocus();
     UpdateState();
+}
+
+// orca-mcp: opens the camera of the selected printer, or raises it if it is already open. A dialog
+// left on another printer is replaced, so one camera stream runs at a time.
+void PrinterWebView::open_camera()
+{
+    const std::string host = camera_host();
+    if (host.empty())
+        return;
+    if (m_camera_dialog) {
+        if (m_camera_host == host) {
+            m_camera_dialog->Raise();
+            return;
+        }
+        m_camera_dialog->Close();
+    }
+    auto* dialog    = new PrinterCameraDialog(wxGetApp().mainframe, host);
+    m_camera_dialog = dialog;
+    m_camera_host   = host;
+    dialog->Show();
 }
 
 bool PrinterWebView::Show(bool show)
@@ -338,6 +441,9 @@ void PrinterWebView::OnLoaded(wxWebViewEvent& evt)
     //ORCA: url loaded successfully, safe to clear
     m_url_deferred.clear();
     SendAPIKey();
+    // orca-mcp: the Camera icon, for a printer whose camera PrinterCameraDialog can show.
+    if (!camera_host().empty())
+        m_browser->RunScript(camera_icon_script());
   
     if (m_handler != nullptr) {
         m_handler->on_loaded(evt);
@@ -355,6 +461,13 @@ void PrinterWebView::OnNewWindow(wxWebViewEvent& evt)
 
 void PrinterWebView::OnScriptMessage(wxWebViewEvent& evt)
 {
+  // orca-mcp: the Camera icon. Opened after the callback returns: GTK and macOS deliver the message
+  // inside the native web view callback, where window work is unsafe.
+  const nlohmann::json message = nlohmann::json::parse(evt.GetString().ToUTF8().data(), nullptr, false);
+  if (message.is_object() && message.value("command", "") == k_open_camera_command) {
+    CallAfter([this] { open_camera(); });
+    return;
+  }
   if (m_handler != nullptr)
     m_handler->on_script_message(evt);
 }

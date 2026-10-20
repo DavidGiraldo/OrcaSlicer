@@ -27,7 +27,9 @@
 #include <wx/tbarbase.h>
 #include "wx/textctrl.h"
 #include <wx/timer.h>
+#include <wx/weakref.h> // orca-mcp: camera dialog handle
 #include <memory>
+#include <string> // orca-mcp: camera dialog host
 #include "Lazy.hpp"
 
 
@@ -60,6 +62,8 @@ private:
     void SendAPIKey();
     void create_browser();
     void reset_browser();
+    // orca-mcp: opened from the Camera icon camera_icon_script() adds to the page.
+    void open_camera();
 
     wxWebView* m_browser;
     long m_zoomFactor;
@@ -70,6 +74,9 @@ private:
     wxString m_url_deferred;
     std::unique_ptr<PrinterWebViewHandler> m_handler;
     bool m_reset_on_show{false};
+    // orca-mcp: the one open camera dialog and the host it shows.
+    wxWeakRef<wxWindow> m_camera_dialog;
+    std::string m_camera_host;
 
     // DECLARE_EVENT_TABLE()
 };

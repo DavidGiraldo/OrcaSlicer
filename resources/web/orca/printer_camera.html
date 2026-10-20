@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Printer Camera</title>
+<script type="text/javascript" src="../include/i18n.js"></script>
+<style>
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: var(--orca-font, sans-serif); }
+video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+#status { position: fixed; left: 0; right: 0; bottom: 0; padding: 6px 10px; font-size: 13px; color: #fff; background: rgba(0, 0, 0, 0.65); }
+#status[hidden] { display: none; }
+</style>
+</head>
+<body>
+<video id="video" autoplay muted playsinline></video>
+<div id="status" hidden></div>
+<script type="text/javascript">
+"use strict";
+// Live view of a Creality K-series camera. The printer serves WebRTC only, signalled by a single HTTP POST
+// of the complete offer to :8000/call/webrtc_local, base64-encoded JSON in both directions. It answers with
+// Access-Control-Allow-Origin: *, so this page can call it from file://. The host comes from the dialog
+// (window.ORCA_CAMERA_HOST) or, when the page is opened directly, from ?host=.
+const host = (typeof ORCA_CAMERA_HOST === "string" && ORCA_CAMERA_HOST) ||
+             new URLSearchParams(location.search).get("host") || "";
+const video = document.getElementById("video");
+const statusEl = document.getElementById("status");
+// The printer's own client uses this STUN server, and the stream depends on it: the web view hides its LAN
+// address behind an mDNS .local name the printer cannot resolve, and without a server-reflexive candidate
+// the printer never completes DTLS (verified on two K2 Plus). It needs internet access to reach the server.
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+const RETRY_MS = 5000;
+const ICE_GATHER_MS = 5000;
+const ANSWER_TIMEOUT_MS = 10000;
+let pc = null;
+let retryTimer = null;
+let stopped = false;
+
+function setStatus(text) {
+  statusEl.textContent = text || "";
+  statusEl.hidden = !text;
+}
+
+function closePeer() {
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+}
+
+function scheduleRetry(text) {
+  closePeer();
+  if (stopped)
+    return;
+  setStatus(text);
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(connect, RETRY_MS);
+}
+
+// The endpoint takes the whole offer at once, so the candidates must be in it before it is sent.
+function waitIceGathering(conn) {
+  return new Promise((resolve) => {
+    if (conn.iceGatheringState === "complete")
+      return resolve();
+    const timer = setTimeout(resolve, ICE_GATHER_MS);
+    conn.addEventListener("icegatheringstatechange", () => {
+      if (conn.iceGatheringState === "complete") {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+  });
+}
+
+async function requestAnswer(offer) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), ANSWER_TIMEOUT_MS);
+  try {
+    // text/plain keeps this a simple request; the endpoint is not known to answer a CORS preflight.
+    const response = await fetch(`http://${host}:8000/call/webrtc_local`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: btoa(JSON.stringify({ type: offer.type, sdp: offer.sdp })),
+      signal: abort.signal,
+    });
+    const text = (await response.text()).trim();
+    // A rejected offer comes back as a bare "{}" rather than base64.
+    const answer = JSON.parse(text.startsWith("{") ? text : atob(text));
+    if (!answer.sdp)
+      throw new Error("the printer returned no answer");
+    return answer;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function connect() {
+  if (stopped)
+    return;
+  setStatus(T("cam_connecting", "Connecting to the camera..."));
+  const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  pc = conn;
+  conn.addTransceiver("video", { direction: "recvonly" });
+  conn.ontrack = (event) => {
+    video.srcObject = event.streams[0] || new MediaStream([event.track]);
+  };
+  conn.onconnectionstatechange = () => {
+    if (conn !== pc)
+      return;
+    if (conn.connectionState === "connected")
+      setStatus("");
+    else if (conn.connectionState === "failed")
+      scheduleRetry(T("cam_reconnecting", "Connection lost. Reconnecting..."));
+    else if (conn.connectionState === "disconnected")
+      // A brief network hiccup can recover on its own; reconnect only if it does not.
+      setTimeout(() => {
+        if (conn === pc && conn.connectionState !== "connected")
+          scheduleRetry(T("cam_reconnecting", "Connection lost. Reconnecting..."));
+      }, RETRY_MS);
+  };
+  try {
+    await conn.setLocalDescription(await conn.createOffer());
+    await waitIceGathering(conn);
+    const answer = await requestAnswer(conn.localDescription);
+    if (conn === pc)
+      await conn.setRemoteDescription(answer);
+  } catch (error) {
+    console.log(`printer camera: ${error}`);
+    if (conn === pc)
+      scheduleRetry(T("cam_unavailable", "The camera did not answer. Retrying..."));
+  }
+}
+
+window.addEventListener("pagehide", () => {
+  stopped = true;
+  clearTimeout(retryTimer);
+  closePeer();
+});
+
+TranslatePage();
+if (!host)
+  setStatus(T("cam_no_host", "Set the printer's address in its connection settings to view the camera."));
+else if (typeof RTCPeerConnection === "undefined")
+  setStatus(T("cam_unsupported", "This system's web view cannot play WebRTC video."));
+else
+  connect();
+</script>
+</body>
+</html>

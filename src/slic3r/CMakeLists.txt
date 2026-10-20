@@ -480,6 +480,9 @@ set(SLIC3R_GUI_SOURCES
     GUI/PrinterWebViewHandler.cpp
     GUI/PrinterWebViewHandler.hpp
     GUI/PrinterWebView.hpp
+    # orca-mcp: the Device tab's camera viewer for Creality K-series printers
+    GUI/PrinterCameraDialog.cpp
+    GUI/PrinterCameraDialog.hpp
     GUI/PrintHostDialogs.cpp
     GUI/PrintHostDialogs.hpp
     GUI/PrintOptionsDialog.cpp

@@ -348,6 +348,7 @@ src/slic3r/GUI/OAuthDialog.cpp
 src/slic3r/GUI/PluginPickerDialog.cpp
 src/slic3r/GUI/PluginsConfigDialog.cpp
 src/slic3r/GUI/PluginsDialog.cpp
+src/slic3r/GUI/PrinterCameraDialog.cpp
 src/slic3r/GUI/PrinterWebView.cpp
 src/slic3r/GUI/Project.cpp
 src/slic3r/GUI/PublishSettingsDialog.hpp
